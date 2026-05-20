@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Environment variables (never commit this)
+.env
+
+# Large files — store locally only
+data/
+outputs/
+models/
+*.mp4
+*.avi
+*.mov
+*.pt
+*.pth
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude project settings — not part of the codebase
+.claude/

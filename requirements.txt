@@ -1,0 +1,7 @@
+opencv-python
+mediapipe
+ultralytics
+anthropic
+chromadb
+python-dotenv
+numpy
