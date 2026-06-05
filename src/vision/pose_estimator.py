@@ -1,11 +1,23 @@
+# cv2 is the OpenCV library — used for reading video files and processing frames
 import cv2
+
+# mediapipe is Google's library for detecting human body keypoints
 import mediapipe as mp
+
+# json is a built-in Python library for saving data as JSON files
 import json
+
+# os is a built-in Python library for file and folder operations
 import os
+
+# numpy is a math library — used here for distance calculation between two points
 import numpy as np
+
+# YOLO is the object detection model from the ultralytics library
 from ultralytics import YOLO
 
 # Load YOLOv8 model for person detection
+# "yolov8n.pt" is the model weights file — downloads automatically on first run
 yolo_model = YOLO("yolov8n.pt")
 
 
@@ -304,6 +316,33 @@ def visualize_pose(video_path: str, output_video_path: str, player_box: tuple):
     cap.release()
     out.release()
     print(f"Saved annotated video → {output_video_path}")
-    
+
+
+# ============================================================
+# This block only runs when you execute this file directly.
+# It won't run if this file is imported by another file.
+# ============================================================
+
+if __name__ == "__main__":
+
+    #VIDEO_PATH = "data/test_clip.MOV"
+    VIDEO_PATH = "data/test_clip_pro.MOV"
+
+    # Step 1: click to select player
+    player_box = select_player(VIDEO_PATH)
+
+    # Step 2: extract keypoints → saves pose_data.json
+    extract_pose_data(
+        video_path=VIDEO_PATH,
+        output_json_path="outputs/pose_data.json",
+        player_box=player_box
+    )
+
+    # Step 3: generate annotated video → saves pose_overlay.mp4
+    visualize_pose(
+        video_path=VIDEO_PATH,
+        output_video_path="outputs/pose_overlay.mp4",
+        player_box=player_box
+    )   
 
 
