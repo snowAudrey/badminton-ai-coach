@@ -1,7 +1,7 @@
 from src.vision.pipeline import run_pipeline
 
-#VIDEO_PATH = "data/test_clip.MOV"
-VIDEO_PATH = "data/test_clip_pro.MOV"
+VIDEO_PATH = "data/test_clip.MOV"
+#VIDEO_PATH = "data/test_clip_pro.MOV"
 
 unified = run_pipeline(
     video_path=VIDEO_PATH,

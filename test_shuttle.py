@@ -10,8 +10,8 @@ from src.vision.shuttle_tracker import detect_shuttle, get_shuttle_positions, ge
 # IMPORTANT: Update this to match your actual video filename
 # Run "ls data/" in the terminal to see your exact filename
 # ============================================================
-VIDEO_PATH = "data/test_clip_pro.MOV"
-#VIDEO_PATH = "data/test_clip.MOV"
+#VIDEO_PATH = "data/test_clip_pro.MOV"
+VIDEO_PATH = "data/test_clip.MOV"
 
 # ============================================================
 # STEP 1: Test detect_shuttle()

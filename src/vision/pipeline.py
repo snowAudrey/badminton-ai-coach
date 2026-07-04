@@ -172,7 +172,7 @@ def run_pipeline(video_path: str, output_dir: str = "outputs", player_box: tuple
 if __name__ == "__main__":
 
     # Path to the test video 
-    VIDEO_PATH = "data/test_clip_pro.MOV"
+    VIDEO_PATH = "data/test_clip.MOV"
 
     unified = run_pipeline(
         video_path=VIDEO_PATH,

@@ -2,8 +2,8 @@ import cv2
 from src.vision.pose_estimator import detect_players, select_player, crop_to_player, extract_pose_data, visualize_pose
 import json
 
-#VIDEO_PATH = "data/test_clip.MOV"
-VIDEO_PATH = "data/test_clip_pro.MOV"
+VIDEO_PATH = "data/test_clip.MOV"
+#VIDEO_PATH = "data/test_clip_pro.MOV"
 
 # ============================================================
 # STEP 1: Test detect_players()
