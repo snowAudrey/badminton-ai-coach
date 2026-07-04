@@ -38,8 +38,6 @@ LANDMARKS = {
     "right_knee": 26,
     "left_ankle": 27,
     "right_ankle": 28
-    #"left_foot_index": 31,    
-    #"right_foot_index": 32   
 }
 
 
@@ -127,6 +125,7 @@ def extract_pose_observations(frame: dict, side: str = "right") -> dict:
             "shuttle_detected": True,
             "elbow_angle": 95.2,
             "knee_angle_racket_side": 142.3,
+            "wrist_height": "overhead",
             "observations": ["elbow angle is 95°"]
         }
     """
@@ -145,8 +144,6 @@ def extract_pose_observations(frame: dict, side: str = "right") -> dict:
         hip_idx = LANDMARKS["right_hip"]
         knee_idx = LANDMARKS["right_knee"]
         ankle_idx = LANDMARKS["right_ankle"]
-        opp_shoulder_idx = LANDMARKS["left_shoulder"]
-        opp_hip_idx = LANDMARKS["left_hip"]
     else:
         shoulder_idx = LANDMARKS["left_shoulder"]
         elbow_idx = LANDMARKS["left_elbow"]
@@ -154,10 +151,9 @@ def extract_pose_observations(frame: dict, side: str = "right") -> dict:
         hip_idx = LANDMARKS["left_hip"]
         knee_idx = LANDMARKS["left_knee"]
         ankle_idx = LANDMARKS["left_ankle"]
-        opp_shoulder_idx = LANDMARKS["right_shoulder"]
-        opp_hip_idx = LANDMARKS["right_hip"]
 
     # Get the keypoints we need
+    nose = get_keypoint(keypoints, LANDMARKS["nose"])
     shoulder = get_keypoint(keypoints, shoulder_idx)
     elbow = get_keypoint(keypoints, elbow_idx)
     wrist = get_keypoint(keypoints, wrist_idx)
@@ -168,6 +164,18 @@ def extract_pose_observations(frame: dict, side: str = "right") -> dict:
     # Calculate joint angles
     elbow_angle = calculate_angle(shoulder, elbow, wrist)
     knee_angle = calculate_angle(hip, knee, ankle)
+
+    # Wrist height relative to head and shoulder. Clear, smash, and drop are
+    # hit overhead (above head height); drive and net are hit just above
+    # shoulder height; lift and defensive shots are hit below shoulder height.
+    wrist_height = None
+    if wrist is not None and nose is not None and shoulder is not None:
+        if wrist["y"] < nose["y"]:
+            wrist_height = "overhead"
+        elif wrist["y"] < shoulder["y"]:
+            wrist_height = "above shoulder"
+        else:
+            wrist_height = "below shoulder"
 
     # Build human-readable observations — raw facts, not judgments.
     # Whether an angle is "good" or "bad" depends on shot type/phase,
@@ -181,6 +189,9 @@ def extract_pose_observations(frame: dict, side: str = "right") -> dict:
     if knee_angle is not None:
         observations.append(f"knee angle is {knee_angle}°")
 
+    if wrist_height is not None:
+        observations.append(f"wrist is {wrist_height}")
+
     if shuttle_detected:
         observations.append("shuttle detected this frame")
 
@@ -191,6 +202,7 @@ def extract_pose_observations(frame: dict, side: str = "right") -> dict:
         "shuttle_detected": shuttle_detected,
         "elbow_angle": elbow_angle,
         "knee_angle": knee_angle,
+        "wrist_height": wrist_height,
         "observations": observations
     }
 
@@ -282,6 +294,7 @@ if __name__ == "__main__":
         print(f"\n  t={obs['timestamp']}s  frame={obs['frame']}  rally={obs['rally_id']}")
         print(f"  Elbow angle: {obs['elbow_angle']}°")
         print(f"  Knee angle:  {obs['knee_angle']}°")
+        print(f"  Wrist height: {obs['wrist_height']}")
         print(f"  Shuttle:     {obs['shuttle_detected']}")
         print(f"  Notes:")
         for note in obs["observations"]:

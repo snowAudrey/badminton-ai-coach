@@ -48,15 +48,31 @@ API_DELAY_SECONDS = 0.5
 TRANSLATION_PROMPT = """You are reviewing pose data sampled from one rally of a badminton match.
 
 Below is a sequence of frame-by-frame observations, ordered by time. Each line
-describes joint angles and shuttle detection for one sampled frame.
+describes joint angles, wrist height relative to the head and shoulder, and
+shuttle detection for one sampled frame.
+
+Note on angle convention: a smaller elbow or knee angle means the joint is
+more bent (flexed); an angle closer to 180° means the joint is straighter
+(extended).
+
+Wrist height is a rough indicator of shot type: overhead usually means clear,
+smash, or drop shot; above shoulder usually means drive or net shot; below
+shoulder usually means lift or a defensive shot. When an observation suggests
+one of these height categories, generate queries covering all of that
+category's shot types (e.g. all three of clear, smash, and drop for an
+overhead pattern) rather than picking just one or two — they can look nearly
+identical in joint angles alone, and the synthesis step can only hedge
+between shots that actually have retrieved facts to draw on.
 
 Look for notable patterns across these frames — specifically, points in time
-where a joint angle changes substantially over a short window, which likely
-marks a swing or shot being played. Describe what changed and roughly when,
-without judging whether the angle itself is correct or typical — you don't
-know what shot was being played or what phase of the shot this is.
+where a joint angle changes substantially over a short window, or the wrist
+height transitions between overhead, above shoulder, and below shoulder —
+either of which likely marks a swing or shot being played. Describe what
+changed and roughly when, without judging whether the angle or wrist height
+itself is correct or typical — you don't know what shot was being played or
+what phase of the shot this is.
 
-Based on these patterns, generate 2 to 5 search queries that could be used to
+Based on these patterns, generate 3 to 8 search queries that could be used to
 look up relevant badminton coaching advice. Each query must name a specific
 badminton shot or technique (e.g. smash, clear, drop shot, net shot, lift,
 drive, serve) together with the body part or movement involved — not a vague
@@ -71,7 +87,7 @@ Observations:
 Return ONLY a valid JSON array of query strings. No explanation, no markdown.
 
 Example output:
-["elbow extension during overhead clear", "knee bend preparation for smash", "standing position when preparing to return a smash"]
+["elbow extension during overhead clear", "knee bend preparation for smash", "standing position when preparing to return a smash", "wrist height during net shot"]
 """
 
 
