@@ -35,20 +35,30 @@ RALLY_END_FRAMES = 90
 # class 0 = 'Shuttlecock' in the custom model
 SHUTTLE_CLASS_ID = 0
 
+# If a detected position recurs at nearly the same pixel across many frames,
+# it's almost certainly a static background object (e.g. equipment) being
+# misclassified as the shuttlecock — a real shuttle in play is essentially
+# always moving. Positions within STATIC_OBJECT_RADIUS_PX of each other that
+# occur in at least STATIC_OBJECT_MIN_FRAMES frames across the whole video
+# are treated as background clutter and excluded from detection.
+STATIC_OBJECT_RADIUS_PX = 10
+STATIC_OBJECT_MIN_FRAMES = 100
 
-def detect_shuttle(frame):
+
+def detect_shuttle_candidates(frame):
     """
     Runs YOLOv8 on a single frame to find the shuttlecock.
-    Returns (x_center, y_center, confidence) as pixel coordinates, or None if not found.
+    Returns ALL detections above the confidence threshold (not just the
+    best one), as a list of (x_center, y_center, confidence) tuples — so
+    that static false positives can be filtered out later by looking at
+    the whole video, instead of guessing from a single frame.
     """
 
     # Run YOLOv8 on the frame
     # verbose=False suppresses YOLOv8's default console output
     results = yolo_model(frame, verbose=False)
 
-    # We'll track the best (highest confidence) detection found
-    best_detection = None
-    best_confidence = 0.0
+    candidates = []
 
     # Loop through all detected objects in the frame
     for result in results:
@@ -67,20 +77,88 @@ def detect_shuttle(frame):
 
             # xyxy gives us (x1, y1, x2, y2) bounding box corners
             x1, y1, x2, y2 = map(int, box.xyxy[0])
- 
+
             # Calculate the center point of the bounding box
             # The shuttle is small so the center is a good single-point representation
             x_center = (x1 + x2) / 2
             y_center = (y1 + y2) / 2
 
-            # Keep track of the highest-confidence detection in this frame
-            # (there should only ever be one shuttle, so we take the best one)
-            if confidence > best_confidence:
-                best_confidence = confidence
-                best_detection = (x_center, y_center, confidence)
- 
-    # Return the best detection, or None if nothing was found
-    return best_detection
+            candidates.append((x_center, y_center, confidence))
+
+    return candidates
+
+
+def detect_shuttle(frame):
+    """
+    Runs YOLOv8 on a single frame and returns only the highest-confidence
+    shuttlecock detection, or None if nothing was found.
+
+    Kept for quick single-frame checks. Full-video processing uses
+    detect_shuttle_candidates() plus static-object filtering instead,
+    since a single frame has no way to know which detection is a static
+    background false positive.
+    """
+
+    candidates = detect_shuttle_candidates(frame)
+
+    if not candidates:
+        return None
+
+    # Return the highest-confidence candidate
+    return max(candidates, key=lambda c: c[2])
+
+
+def find_static_false_positives(frame_candidates: list) -> list:
+    """
+    Scans every candidate detection across the whole video and flags any
+    position that recurs at nearly the same pixel in an implausibly large
+    number of frames. A real shuttle in play is essentially always moving —
+    a position that stays fixed for a large fraction of the video is almost
+    certainly a static background object that resembles a shuttlecock, not
+    the shuttle itself.
+
+    Args:
+        frame_candidates: List of dicts, each with a "candidates" key
+                           holding that frame's list of (x, y, confidence)
+                           tuples from detect_shuttle_candidates()
+
+    Returns:
+        List of (x, y) positions to exclude.
+    """
+
+    # Round each candidate's position to group near-identical detections
+    # together, and count how many frames each rounded position appears in
+    position_counts = {}
+    for entry in frame_candidates:
+        for x, y, _ in entry["candidates"]:
+            bucket = (round(x / STATIC_OBJECT_RADIUS_PX), round(y / STATIC_OBJECT_RADIUS_PX))
+            position_counts[bucket] = position_counts.get(bucket, 0) + 1
+
+    static_buckets = [
+        bucket for bucket, count in position_counts.items()
+        if count >= STATIC_OBJECT_MIN_FRAMES
+    ]
+
+    # Convert bucket coordinates back to approximate pixel coordinates
+    return [
+        (bucket_x * STATIC_OBJECT_RADIUS_PX, bucket_y * STATIC_OBJECT_RADIUS_PX)
+        for bucket_x, bucket_y in static_buckets
+    ]
+
+
+def _is_near_static_position(candidate, static_positions: list) -> bool:
+    """
+    Returns True if this candidate's position is close to one of the
+    flagged static background positions.
+    """
+
+    x, y, _ = candidate
+    tolerance = STATIC_OBJECT_RADIUS_PX * 2
+
+    return any(
+        np.sqrt((x - sx) ** 2 + (y - sy) ** 2) <= tolerance
+        for sx, sy in static_positions
+    )
 
 
 def get_shuttle_positions(video_path: str, output_json_path: str):
@@ -108,65 +186,88 @@ def get_shuttle_positions(video_path: str, output_json_path: str):
     # Get total frame count — used for progress printing
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
  
-    # List to store shuttle data for every frame
-    all_frames = []
- 
+    # List to store ALL candidate detections for every frame — filtering
+    # down to one detection per frame happens after this first pass, once
+    # we know which positions are static background clutter
+    frame_candidates = []
+
     # Counter to track which frame we're on
     frame_index = 0
- 
+
     print(f"Processing {total_frames} frames for shuttle detection...")
- 
+
     # Loop through every frame in the video
     while cap.isOpened():
- 
+
         # Read the next frame
         ret, frame = cap.read()
- 
+
         # Stop if the video has ended
         if not ret:
             break
- 
-        # Try to detect the shuttle in this frame
-        detection = detect_shuttle(frame)
- 
-        # Build the data entry for this frame
-        if detection is not None:
- 
-            # Shuttle was found — unpack the coordinates and confidence
-            x, y, conf = detection
- 
+
+        # Collect every detection above the confidence threshold this frame
+        candidates = detect_shuttle_candidates(frame)
+
+        frame_candidates.append({
+            "frame": frame_index,
+            "timestamp": round(frame_index / fps, 3),
+            "candidates": candidates
+        })
+
+        # Print progress every 100 frames so you know it's running
+        if frame_index % 100 == 0:
+            print(f"  Frame {frame_index} / {total_frames}")
+
+        frame_index += 1
+
+    # Release the video file
+    cap.release()
+
+    # Find any position that recurs suspiciously often across the whole
+    # video — almost certainly a static background object, not the shuttle
+    static_positions = find_static_false_positives(frame_candidates)
+    if static_positions:
+        print(f"Filtering out {len(static_positions)} static false-positive position(s): {static_positions}")
+
+    # Second pass: for each frame, pick the highest-confidence candidate
+    # that isn't a flagged static position
+    all_frames = []
+    for entry in frame_candidates:
+
+        remaining = [
+            c for c in entry["candidates"]
+            if not _is_near_static_position(c, static_positions)
+        ]
+
+        if remaining:
+
+            # Shuttle was found — take the highest-confidence remaining candidate
+            x, y, conf = max(remaining, key=lambda c: c[2])
+
             frame_data = {
-                "frame": frame_index,
-                "timestamp": round(frame_index / fps, 3),
+                "frame": entry["frame"],
+                "timestamp": entry["timestamp"],
                 "shuttle_x": round(x, 2),
                 "shuttle_y": round(y, 2),
                 "confidence": round(conf, 3),
                 "detected": True
             }
- 
+
         else:
- 
+
             # Shuttle was not found this frame — store nulls so the frame is still recorded
             frame_data = {
-                "frame": frame_index,
-                "timestamp": round(frame_index / fps, 3),
+                "frame": entry["frame"],
+                "timestamp": entry["timestamp"],
                 "shuttle_x": None,
                 "shuttle_y": None,
                 "confidence": None,
                 "detected": False
             }
- 
+
         all_frames.append(frame_data)
- 
-        # Print progress every 100 frames so you know it's running
-        if frame_index % 100 == 0:
-            print(f"  Frame {frame_index} / {total_frames}")
- 
-        frame_index += 1
- 
-    # Release the video file
-    cap.release()
- 
+
     # Create output folder if it doesn't exist
     os.makedirs(os.path.dirname(output_json_path), exist_ok=True)
  
@@ -415,7 +516,8 @@ def visualize_shuttle(video_path: str, output_video_path: str, shuttle_positions
 if __name__ == "__main__":
 
     # Path to the test video 
-    VIDEO_PATH = "data/test_clip_pro.MOV"
+    VIDEO_PATH = "data/test_clip.MOV"
+    #VIDEO_PATH = "data/test_clip_pro.MOV"
 
     # Step 1: extract shuttle positions for every frame and save to JSON
     shuttle_positions = get_shuttle_positions(
