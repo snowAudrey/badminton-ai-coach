@@ -3,6 +3,8 @@ import cv2
 
 # mediapipe is Google's library for detecting human body keypoints
 import mediapipe as mp
+from mediapipe.tasks.python import vision
+from mediapipe.tasks.python.core.base_options import BaseOptions
 
 # json is a built-in Python library for saving data as JSON files
 import json
@@ -19,6 +21,30 @@ from ultralytics import YOLO
 # Load YOLOv8 model for person detection
 # "yolov8n.pt" is the model weights file — downloads automatically on first run
 yolo_model = YOLO("yolov8n.pt")
+
+# Path to the downloaded pose landmarker model bundle (Tasks API)
+POSE_MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "models", "pose_landmarker_lite.task"
+)
+
+
+def _create_pose_landmarker():
+    """
+    Creates a PoseLandmarker configured for per-frame, stateless detection
+    (IMAGE mode). IMAGE mode is used instead of VIDEO mode because this
+    pipeline re-crops a different, moving bounding-box region every frame
+    (tracking a moving player), which would violate VIDEO mode's assumption
+    of a spatially-continuous frame stream.
+    """
+    options = vision.PoseLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=POSE_MODEL_PATH),
+        running_mode=vision.RunningMode.IMAGE,
+        num_poses=1,
+        min_pose_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    return vision.PoseLandmarker.create_from_options(options)
 
 
 def detect_players(frame):
@@ -135,19 +161,17 @@ def extract_pose_data(video_path: str, output_json_path: str, player_box: tuple)
     Saves results as a JSON file with frame index, timestamp, and 33 body landmarks.
     """
  
-    # Access MediaPipe's pose detection module
-    mp_pose = mp.solutions.pose
-    
     # Opens the video file and gets frames per second to calculate timestamps
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
- 
+
     all_frames = []
     frame_index = 0
     # Start with the user's selected bounding box as the last known position
     last_known_box = player_box
- 
-    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+
+    landmarker = _create_pose_landmarker()
+    try:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -188,22 +212,25 @@ def extract_pose_data(video_path: str, output_json_path: str, player_box: tuple)
 
             # Crop the frame to just the selected player's current position
             cropped_frame, adjusted_box = crop_to_player(frame, last_known_box)
- 
+
             # MediaPipe requires RGB, OpenCV loads BGR
             rgb_frame = cv2.cvtColor(cropped_frame, cv2.COLOR_BGR2RGB)
- 
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+
             # Run pose detection on the cropped player region
-            results = pose.process(rgb_frame)
- 
+            result = landmarker.detect(mp_image)
+
             # Empty list to store keypoints for this frame
             keypoints = []
- 
+
             # Only extract keypoints if a person was detected
-            if results.pose_landmarks:
- 
-                # Loop through all 33 body landmarks
-                for landmark in results.pose_landmarks.landmark:
- 
+            if result.pose_landmarks:
+
+                # result.pose_landmarks is a list of detected people (we only
+                # asked for num_poses=1) — take the first/only one, which is
+                # itself a list of 33 body landmarks
+                for landmark in result.pose_landmarks[0]:
+
                     # x, y, z are fractions of the cropped region (0.0-1.0), not pixel coordinates
                     keypoints.append({
                         "x": landmark.x,
@@ -211,7 +238,7 @@ def extract_pose_data(video_path: str, output_json_path: str, player_box: tuple)
                         "z": landmark.z,
                         "visibility": landmark.visibility
                     })
- 
+
             all_frames.append({
                 "frame": frame_index,
                 # Convert frame number to seconds using fps
@@ -219,7 +246,9 @@ def extract_pose_data(video_path: str, output_json_path: str, player_box: tuple)
                 "keypoints": keypoints
             })
             frame_index += 1
- 
+    finally:
+        landmarker.close()
+
     cap.release()
  
     # Create output folder if it doesn't exist
@@ -242,10 +271,6 @@ def visualize_pose(video_path: str, output_video_path: str, player_box: tuple):
     Use this to visually verify pose detection is working correctly.
     """
 
-    # Access MediaPipe's pose detection and drawing modules
-    mp_pose = mp.solutions.pose
-    mp_drawing = mp.solutions.drawing_utils
- 
     # Open the video file and get video properties
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -260,13 +285,14 @@ def visualize_pose(video_path: str, output_video_path: str, player_box: tuple):
     out = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
  
     last_known_box = player_box
- 
-    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+
+    landmarker = _create_pose_landmarker()
+    try:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
- 
+
             boxes = detect_players(frame)
             if boxes:
                 last_center_x = (last_known_box[0] + last_known_box[2]) / 2
@@ -285,34 +311,38 @@ def visualize_pose(video_path: str, output_video_path: str, player_box: tuple):
                     if distance < min_distance:
                         min_distance = distance
                         closest_box = (x1, y1, x2, y2)
- 
+
                 if min_distance < 300:
                     last_known_box = closest_box
- 
+
             cropped_frame, (cx1, cy1, cx2, cy2) = crop_to_player(frame, last_known_box)
             rgb_cropped = cv2.cvtColor(cropped_frame, cv2.COLOR_BGR2RGB)
-            results = pose.process(rgb_cropped)
- 
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_cropped)
+            result = landmarker.detect(mp_image)
+
             # If a person was detected, draw the skeleton
-            if results.pose_landmarks:
- 
+            if result.pose_landmarks:
+
                 # Draw the skeleton lines and joint dots on the cropped frame
-                mp_drawing.draw_landmarks(
+                vision.drawing_utils.draw_landmarks(
                     # Frame to draw on
                     cropped_frame,
-                    # The 33 detected landmark positions
-                    results.pose_landmarks,
+                    # The 33 detected landmark positions for the first/only person
+                    result.pose_landmarks[0],
                     # Lines connecting the landmarks (e.g. shoulder → elbow → wrist)
-                    mp_pose.POSE_CONNECTIONS
+                    connections=vision.PoseLandmarksConnections.POSE_LANDMARKS,
+                    landmark_drawing_spec=vision.drawing_styles.get_default_pose_landmarks_style(),
                 )
- 
+
                 # Paste the annotated cropped region back into the full frame
                 # This keeps the rest of the video intact while only annotating our player
                 frame[cy1:cy2, cx1:cx2] = cropped_frame
- 
+
             # Write the full annotated frame to the output video
             out.write(frame)
- 
+    finally:
+        landmarker.close()
+
     cap.release()
     out.release()
     print(f"Saved annotated video → {output_video_path}")
@@ -325,8 +355,8 @@ def visualize_pose(video_path: str, output_video_path: str, player_box: tuple):
 
 if __name__ == "__main__":
 
-    #VIDEO_PATH = "data/test_clip.MOV"
-    VIDEO_PATH = "data/test_clip_pro.MOV"
+    VIDEO_PATH = "data/test_clip.MOV"
+    #VIDEO_PATH = "data/test_clip_pro.MOV"
 
     # Step 1: click to select player
     player_box = select_player(VIDEO_PATH)
