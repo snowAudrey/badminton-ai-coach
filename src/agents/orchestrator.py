@@ -96,6 +96,13 @@ Important rules:
   phase)" — you don't actually know what phase of the shot this is, only
   that the angle changed, so naming a phase would overstate what the data
   supports.
+- A complete badminton action (preparation through follow-through) typically
+  takes at least about 1 second. Instead of citing only the two samples
+  where the angle change looked sharpest, look at the surrounding
+  observations immediately before and after that change and include them in
+  the cited range, so the timestamp window reflects the shot's realistic
+  duration (at least ~1 second) rather than just the moment of fastest
+  change.
 
 Pose observations:
 {observations_text}
