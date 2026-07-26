@@ -39,10 +39,12 @@ SHUTTLE_CLASS_ID = 0
 # it's almost certainly a static background object (e.g. equipment) being
 # misclassified as the shuttlecock — a real shuttle in play is essentially
 # always moving. Positions within STATIC_OBJECT_RADIUS_PX of each other that
-# occur in at least STATIC_OBJECT_MIN_FRAMES frames across the whole video
-# are treated as background clutter and excluded from detection.
+# occur in at least this fraction of the video's frames are treated as
+# background clutter and excluded from detection. A fraction (not a fixed
+# frame count) so the filter scales correctly across videos of different
+# lengths.
 STATIC_OBJECT_RADIUS_PX = 10
-STATIC_OBJECT_MIN_FRAMES = 100
+STATIC_OBJECT_MIN_FRAME_FRACTION = 0.05
 
 
 def detect_shuttle_candidates(frame):
@@ -126,6 +128,11 @@ def find_static_false_positives(frame_candidates: list) -> list:
         List of (x, y) positions to exclude.
     """
 
+    # Compute the minimum frame count from a fraction of this video's total
+    # frames, rather than using a fixed number, so the filter scales
+    # correctly across videos of different lengths
+    min_frames = STATIC_OBJECT_MIN_FRAME_FRACTION * len(frame_candidates)
+
     # Round each candidate's position to group near-identical detections
     # together, and count how many frames each rounded position appears in
     position_counts = {}
@@ -136,7 +143,7 @@ def find_static_false_positives(frame_candidates: list) -> list:
 
     static_buckets = [
         bucket for bucket, count in position_counts.items()
-        if count >= STATIC_OBJECT_MIN_FRAMES
+        if count >= min_frames
     ]
 
     # Convert bucket coordinates back to approximate pixel coordinates
