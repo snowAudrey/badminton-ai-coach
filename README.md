@@ -1,12 +1,12 @@
 # Badminton AI Coach
 
-Turns raw amateur badminton match video into timestamped, technique-specific coaching feedback — no coach required.
+Turns short (under 1 minute) raw amateur badminton video into timestamped, technique-specific coaching feedback.
 
 **Status: functional end to end — actively refining.**
 
 ## Why
 
-For amateur sports enthusiasts, access to a personal coach is often out of reach because it can be too expensive or simply unavailable. As a badminton player myself, I wanted feedback on my technique whenever I played, not just when I could find a coach.
+For amateur sports enthusiasts, access to a personal coach is often out of reach because it can be too expensive or simply unavailable. As a badminton player myself, I wanted feedback on my technique whenever I played, not just when I could find a coach. This project is meant as a training aid that supplements coaching rather than replaces it. The feedback it produces is a starting point for reflection instead of a substitute for a coach's judgment. It's also deliberately built for short clips: reviewing one or two rallies at a time keeps the feedback focused and actionable, so you can improve a little each session rather than being overwhelmed by everything at once.
 
 ## How it works
 
@@ -82,7 +82,7 @@ reduces power.
 
 ## Current status and known limitations
 
-- Tested only on short clips (~15-34 seconds) so far — untested on longer or full-length match footage
+- Tested on clips of ~15-34 seconds so far — longer videos, even within the intended under-1-minute range, are untested
 - Pose detection: 100% of frames on self-recorded test footage
 - Shuttle detection: ~19% of frames on amateur footage — lower than the 0.608 mAP50 the underlying model achieves on its own validation set, since real-world amateur footage (lighting, background clutter, camera angle) is harder than the training distribution. Improving this is planned as its own follow-up project.
 - Shot-type identification is inherently ambiguous from pose data alone, with no shuttle trajectory or court-position context yet, so feedback deliberately names multiple plausible shot types rather than guessing confidently.
