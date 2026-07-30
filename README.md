@@ -88,7 +88,7 @@ reduces power.
 - Shot-type identification is inherently ambiguous from pose data alone, with no shuttle trajectory or court-position context yet, so feedback deliberately names multiple plausible shot types rather than guessing confidently.
 - Rally segmentation relies on a fixed stillness threshold (`RALLY_END_FRAMES`, currently 3 seconds) tuned to the original test clip's pacing — longer natural pauses between points in other footage can cause rallies to be split or merged incorrectly, so this threshold may need retuning per video.
 - Shuttle detection depends on the camera's shooting angle — on footage where overhead space isn't well captured, shots hit high (e.g. clears, lifts) can go undetected entirely, independent of the model's accuracy.
-- Search query generation is non-deterministic — a plausible shot type (e.g. drop shot alongside clear and smash for an overhead pattern) can occasionally be left out of a given run's hedge between multiple shot types, even though the underlying prompt asks for full coverage.
+- Search query generation is non-deterministic — a plausible shot type (e.g. drop shot alongside clear and smash for an overhead pattern) can occasionally be left out of a given run's split between multiple shot types, even though the underlying prompt asks for full coverage.
 
 ## Roadmap
 
