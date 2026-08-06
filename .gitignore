@@ -18,6 +18,9 @@ models/
 *.pt
 *.pth
 
+# Exception: small web-compressed videos for the GitHub Pages site
+!docs/assets/*.mp4
+
 # Jupyter
 .ipynb_checkpoints/
 

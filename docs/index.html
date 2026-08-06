@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Badminton AI Coach</title>
+<meta name="description" content="Turns short amateur badminton video into timestamped, technique-specific coaching feedback.">
+<style>
+  :root {
+    --bg: #fbfbf9;
+    --text: #1c2321;
+    --muted: #5a6661;
+    --accent: #0f766e;
+    --card: #ffffff;
+    --border: #e4e7e2;
+    --code-bg: #f0f2ef;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #131715;
+      --text: #e8ebe8;
+      --muted: #9aa5a0;
+      --accent: #34c7ba;
+      --card: #1b201d;
+      --border: #2b322e;
+      --code-bg: #222824;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    padding: 0 1.25rem;
+  }
+  main { max-width: 860px; margin: 0 auto; }
+  header.hero { padding: 4.5rem 0 3rem; text-align: center; }
+  .hero h1 { font-size: 2.4rem; letter-spacing: -0.02em; margin-bottom: 0.75rem; }
+  .hero .tagline { font-size: 1.2rem; color: var(--muted); max-width: 40rem; margin: 0 auto 1.5rem; }
+  .hero .links a {
+    display: inline-block;
+    text-decoration: none;
+    font-weight: 600;
+    color: var(--accent);
+    border: 1.5px solid var(--accent);
+    border-radius: 999px;
+    padding: 0.45rem 1.2rem;
+    margin: 0 0.3rem;
+    transition: opacity 0.15s;
+  }
+  .hero .links a:hover { opacity: 0.75; }
+  section { padding: 2.25rem 0; border-top: 1px solid var(--border); }
+  h2 { font-size: 1.45rem; margin-bottom: 0.4rem; letter-spacing: -0.01em; }
+  .section-lede { color: var(--muted); margin-bottom: 1.5rem; }
+  video {
+    width: 100%;
+    max-width: 100%;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    display: block;
+    background: #000;
+  }
+  .caption { font-size: 0.85rem; color: var(--muted); margin-top: 0.6rem; text-align: center; }
+  .duo { display: flex; gap: 1.5rem; align-items: flex-start; flex-wrap: wrap; }
+  .duo .clip { flex: 1 1 240px; max-width: 320px; margin: 0 auto; }
+  .duo .feedback { flex: 2 1 380px; }
+  .feedback-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.25rem 1.4rem;
+    font-size: 0.95rem;
+  }
+  .feedback-card p { margin-bottom: 1rem; }
+  .feedback-card p:last-child { margin-bottom: 0; }
+  .feedback-card .t { color: var(--accent); font-weight: 600; }
+  .steps { display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 1.25rem; }
+  .step {
+    flex: 1 1 220px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.1rem 1.2rem;
+  }
+  .step .num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 1.7rem; height: 1.7rem; border-radius: 50%;
+    background: var(--accent); color: var(--bg);
+    font-weight: 700; font-size: 0.9rem; margin-bottom: 0.6rem;
+  }
+  .step h3 { font-size: 1.02rem; margin-bottom: 0.35rem; }
+  .step p { font-size: 0.9rem; color: var(--muted); }
+  .step code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.82em;
+    background: var(--code-bg);
+    padding: 0.1em 0.35em;
+    border-radius: 4px;
+  }
+  ul.limits { margin: 0.75rem 0 0 1.2rem; color: var(--muted); font-size: 0.95rem; }
+  ul.limits li { margin-bottom: 0.5rem; }
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 2rem 0 3rem;
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  footer a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+
+  <header class="hero">
+    <h1>Badminton AI Coach</h1>
+    <p class="tagline">Turns short (under 1 minute) raw amateur badminton video into timestamped, technique-specific coaching feedback.</p>
+    <div class="links">
+      <a href="https://github.com/snowAudrey/badminton-ai-coach">View on GitHub</a>
+    </div>
+  </header>
+
+  <section>
+    <h2>Why</h2>
+    <p>For amateur sports enthusiasts, access to a personal coach is often out of reach because it can be too expensive or simply unavailable. As a badminton player myself, I wanted feedback on my technique whenever I played, not just when I could find a coach. This project is meant as a training aid that supplements coaching rather than replaces it. The feedback it produces is a starting point for reflection instead of a substitute for a coach's judgment. It's also deliberately built for short clips: reviewing one or two rallies at a time keeps the feedback focused and actionable, so you can improve a little each session rather than being overwhelmed by everything at once.</p>
+  </section>
+
+  <section>
+    <h2>Demo</h2>
+    <p class="section-lede">One command takes a raw clip to per-rally coaching feedback: select the player to analyze with a click, and the pipeline does the rest.</p>
+    <video src="assets/demo.mp4" controls muted playsinline preload="metadata"></video>
+    <p class="caption">Real, uncut input and output — only about a minute of processing in the middle is trimmed for brevity.</p>
+  </section>
+
+  <section>
+    <h2>What it sees, what it says</h2>
+    <p class="section-lede">A skeleton is tracked on the selected player frame by frame; the feedback cites specific timestamps and joint angles from that data.</p>
+    <div class="duo">
+      <div class="clip">
+        <video src="assets/pose_overlay_clip.mp4" controls muted loop playsinline preload="metadata"></video>
+        <p class="caption">Pose tracking locked to the selected player — the on-video counter shows the original clip time, matching the timestamps in the feedback</p>
+      </div>
+      <div class="feedback">
+        <div class="feedback-card">
+          <p><span class="t">Around t=3.3s</span> (overhead position with shuttle contact): your elbow extends to 151° and wrist moves overhead. If this is a clear or smash, focus on accelerating your elbow forwards after this preparation — the facts emphasize that delayed elbow movement and chest stretch are key to power. If a smash specifically, avoid rotating only your forearm; rotate your whole arm and complete the sequence with your wrist for full power generation.</p>
+          <p><span class="t">Around t=7.6s–7.9s,</span> with wrist below shoulder and very extended elbow (171–174°): this appears to be a lift or low defensive shot. Ensure you're lifting with height to give your partner time to recover; lifting flat onto the strings makes it easier for your opponent to attack. Your knee angle here (135–145°) shows some bend, which is good for control, but commit to driving through with height.</p>
+          <p><span class="t">Around t=9.4s–9.9s</span> (overhead position with shuttle contact): this could be a clear, smash, or drop shot. If a smash: your elbow angle changes sharply from 47° to 174° — keep your elbow back longer during the early preparation to stretch your chest before explosive acceleration, rather than extending it so quickly. Also ensure you rotate your whole forearm and wrist together at the end for maximum power, not just the lower forearm.</p>
+        </div>
+        <p class="caption">Feedback excerpt from the same rally — generated, not hand-written</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>How it works</h2>
+    <div class="steps">
+      <div class="step">
+        <span class="num">1</span>
+        <h3>See</h3>
+        <p>YOLOv8 detects the players and a custom-trained model tracks the shuttlecock. MediaPipe extracts 33 body keypoints per frame for the selected player, and shuttle movement segments the clip into rallies.</p>
+      </div>
+      <div class="step">
+        <span class="num">2</span>
+        <h3>Retrieve</h3>
+        <p>Claude reads the rally's joint-angle and wrist-height patterns and turns them into search queries against a knowledge base of ~2,900 coaching facts extracted from 165 tutorial videos (ChromaDB).</p>
+      </div>
+      <div class="step">
+        <span class="num">3</span>
+        <h3>Coach</h3>
+        <p>Claude writes timestamped feedback grounded strictly in the retrieved facts — naming several plausible shot types when the data is ambiguous instead of guessing confidently.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Honest limitations</h2>
+    <ul class="limits">
+      <li>Shot-type identification from pose alone is inherently ambiguous — feedback names multiple plausible shots rather than guessing.</li>
+      <li>Shuttle detection is sensitive to lighting, background clutter, and camera angle on amateur footage.</li>
+      <li>Tested on ~15–34 second clips so far; feedback quality is a starting point for reflection, not a substitute for a coach's judgment.</li>
+    </ul>
+  </section>
+
+  <footer>
+    <p><a href="https://github.com/snowAudrey/badminton-ai-coach">github.com/snowAudrey/badminton-ai-coach</a></p>
+    <p>Built by Xue He, with guidance from Claude AI.</p>
+  </footer>
+
+</main>
+</body>
+</html>
