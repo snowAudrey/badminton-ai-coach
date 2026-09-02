@@ -2,8 +2,6 @@
 
 Turns short (under 1 minute) raw amateur badminton video into timestamped, technique-specific coaching feedback.
 
-**Status: functional end to end — actively refining.**
-
 ## Why
 
 For amateur sports enthusiasts, access to a personal coach is often out of reach because it can be too expensive or simply unavailable. As a badminton player myself, I wanted feedback on my technique whenever I played, not just when I could find a coach. This project is meant as a training aid that supplements coaching rather than replaces it. The feedback it produces is a starting point for reflection instead of a substitute for a coach's judgment. It's also deliberately built for short clips: reviewing one or two rallies at a time keeps the feedback focused and actionable, so you can improve a little each session rather than being overwhelmed by everything at once.
