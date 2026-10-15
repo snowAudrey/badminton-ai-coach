@@ -1,0 +1,11 @@
+time_s,frame,shot_type,side
+3.837,115,drop,forehand
+5.539,166,lift,forehand
+7.641,229,block/defence,forehand
+9.9,297,drop,forehand
+17.985,539,serve,forehand
+20.354,610,lift,forehand
+22.89,686,net shot,forehand
+25.526,765,clear,forehand
+27.594,827,clear,forehand
+30.497,914,clear,forehand

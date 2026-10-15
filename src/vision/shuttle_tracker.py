@@ -24,14 +24,6 @@ yolo_model = YOLO("models/best.pt")
 # Higher = fewer detections but more reliable
 CONFIDENCE_THRESHOLD = 0.3
 
-# A rally is considered "active" when the shuttle moves at least this many pixels
-# between consecutive frames. Below this = shuttle is still / between points.
-MIN_SHUTTLE_MOVEMENT_PX = 5
- 
-# How many consecutive frames without movement before we call a rally "ended"
-# At 30fps, 90 frames = 3 seconds of stillness
-RALLY_END_FRAMES = 90
- 
 # class 0 = 'Shuttlecock' in the custom model
 SHUTTLE_CLASS_ID = 0
 
@@ -290,164 +282,6 @@ def get_shuttle_positions(video_path: str, output_json_path: str):
     return all_frames
 
 
-def get_rally_segments(shuttle_positions: list, fps: float):
-    """
-    Takes the list of shuttle positions (from get_shuttle_positions) and groups
-    frames into rally segments based on shuttle movement.
-
-    A rally is "active" when the shuttle is detected and moving.
-    A rally "ends" when the shuttle stops moving or disappears for RALLY_END_FRAMES consecutive frames.
-
-    Returns a list of rally segments:
-    [
-        {
-            "rally_id": 1,
-            "start_frame": 45,
-            "end_frame": 210,
-            "start_time": 1.5,
-            "end_time": 7.0,
-            "frame_count": 165
-        },
-        ...
-    ]
-    """
-
-    # List to store completed rally segments
-    rallies = []
-
-    # Rally ID counter — increments each time a new rally starts
-    rally_id = 0
-
-    # Track whether we are currently inside an active rally
-    in_rally = False
-
-    # Store the frame index where the current rally started
-    rally_start_frame = None
-    rally_start_time = None
-
-    # Track the last known shuttle position — used to measure movement
-    last_x = None
-    last_y = None
-
-    # Count consecutive frames where the shuttle hasn't moved
-    # When this hits RALLY_END_FRAMES, we declare the rally over
-    still_frame_count = 0
-
-    # Loop through every frame's data
-    for frame_data in shuttle_positions:
-
-        frame_idx = frame_data["frame"]
-        timestamp = frame_data["timestamp"]
-        detected = frame_data["detected"]
-
-        if not detected:
-
-            # Shuttle not found this frame
-            if in_rally:
-                # We're inside a rally — count this as a "still" frame
-                still_frame_count += 1
-
-                # If the shuttle has been gone long enough, end the rally
-                if still_frame_count >= RALLY_END_FRAMES:
-                    rallies.append({
-                        "rally_id": rally_id,
-                        "start_frame": rally_start_frame,
-                        # End the rally RALLY_END_FRAMES ago (last time we saw movement)
-                        "end_frame": frame_idx - RALLY_END_FRAMES,
-                        "start_time": rally_start_time,
-                        "end_time": round(timestamp - (RALLY_END_FRAMES / fps), 3),
-                        "frame_count": (frame_idx - RALLY_END_FRAMES) - rally_start_frame
-                    })
-                    # Reset rally tracking state
-                    in_rally = False
-                    last_x = None
-                    last_y = None
-                    still_frame_count = 0
-
-            # Nothing more to do if shuttle isn't detected
-            continue
-
-        # Shuttle WAS detected this frame — get its position
-        current_x = frame_data["shuttle_x"]
-        current_y = frame_data["shuttle_y"]
-
-        if last_x is None:
-            # First detection — can't measure movement yet, just store the position
-            last_x = current_x
-            last_y = current_y
-
-            # If we weren't in a rally, start one
-            if not in_rally:
-                in_rally = True
-                rally_id += 1
-                rally_start_frame = frame_idx
-                rally_start_time = timestamp
-                still_frame_count = 0
-
-            continue
-
-        # Calculate how far the shuttle moved since the last detected frame
-        # This is straight-line (Euclidean) distance in pixels
-        movement = np.sqrt((current_x - last_x) ** 2 + (current_y - last_y) ** 2)
-
-        if movement >= MIN_SHUTTLE_MOVEMENT_PX:
-
-            # Shuttle is moving — this is an active rally frame
-            still_frame_count = 0  # Reset the stillness counter
-
-            if not in_rally:
-                # Movement detected but we weren't tracking a rally — start one
-                in_rally = True
-                rally_id += 1
-                rally_start_frame = frame_idx
-                rally_start_time = timestamp
-
-        else:
-
-            # Shuttle barely moved — count as a still frame
-            if in_rally:
-                still_frame_count += 1
-
-                if still_frame_count >= RALLY_END_FRAMES:
-                    # End the current rally
-                    rallies.append({
-                        "rally_id": rally_id,
-                        "start_frame": rally_start_frame,
-                        "end_frame": frame_idx - RALLY_END_FRAMES,
-                        "start_time": rally_start_time,
-                        "end_time": round(timestamp - (RALLY_END_FRAMES / fps), 3),
-                        "frame_count": (frame_idx - RALLY_END_FRAMES) - rally_start_frame
-                    })
-                    in_rally = False
-                    last_x = None
-                    last_y = None
-                    still_frame_count = 0
-                    continue
-
-        # Update last known position
-        last_x = current_x
-        last_y = current_y
-
-    # If we reached the end of the video while still inside a rally, close it out
-    if in_rally and shuttle_positions:
-        last_frame = shuttle_positions[-1]
-        rallies.append({
-            "rally_id": rally_id,
-            "start_frame": rally_start_frame,
-            "end_frame": last_frame["frame"],
-            "start_time": rally_start_time,
-            "end_time": last_frame["timestamp"],
-            "frame_count": last_frame["frame"] - rally_start_frame
-        })
-
-    print(f"Found {len(rallies)} rally segments")
-    for r in rallies:
-        print(f"  Rally {r['rally_id']}: frames {r['start_frame']}–{r['end_frame']} "
-              f"({r['start_time']}s – {r['end_time']}s)")
-
-    return rallies
-
-
 def visualize_shuttle(video_path: str, output_video_path: str, shuttle_positions: list):
     """
     Saves an annotated copy of the video with the shuttle position marked on each frame.
@@ -532,13 +366,7 @@ if __name__ == "__main__":
         output_json_path="outputs/shuttle_data.json"
     )
 
-    # Step 2: group frames into rally segments based on shuttle movement
-    cap = cv2.VideoCapture(VIDEO_PATH)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    cap.release()
-    rallies = get_rally_segments(shuttle_positions, fps)
-
-    # Step 3: save an annotated video so you can visually check detection quality
+    # Step 2: save an annotated video so you can visually check detection quality
     visualize_shuttle(
         video_path=VIDEO_PATH,
         output_video_path="outputs/shuttle_overlay.mp4",

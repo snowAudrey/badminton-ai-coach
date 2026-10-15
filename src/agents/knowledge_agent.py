@@ -37,15 +37,15 @@ API_DELAY_SECONDS = 0.5
 # TRANSLATION PROMPT
 # ============================================================
 # This prompt is step 1 of the bridge: it asks the LLM to look at a
-# sequence of pose observations from one rally and turn any notable
+# sequence of pose observations from one time window and turn any notable
 # patterns into search queries written in coaching language.
 #
 # The LLM is NOT looking at the coaching knowledge base here — it's
 # using its own general badminton knowledge to guess what techniques
 # might be involved. The actual coaching facts are retrieved afterwards
-# in retrieve_knowledge_for_rally().
+# in retrieve_knowledge_for_segment().
 
-TRANSLATION_PROMPT = """You are reviewing pose data sampled from one rally of a badminton match.
+TRANSLATION_PROMPT = """You are reviewing pose data sampled from a short stretch (up to 30 seconds) of a badminton clip.
 
 Below is a sequence of frame-by-frame observations, ordered by time. Each line
 describes joint angles, wrist height relative to the head and shoulder, and
@@ -92,37 +92,47 @@ Example output:
 
 
 # ============================================================
-# STEP 1: GROUP OBSERVATIONS BY RALLY
+# STEP 1: GROUP OBSERVATIONS BY TIME WINDOW
 # ============================================================
 
-def group_observations_by_rally(observations: list) -> dict:
-    """
-    Groups a flat list of observation dicts (from vision_agent.analyze_video)
-    into a dict keyed by rally_id.
+# Longest stretch of a clip sent to Claude in one go, in seconds
+WINDOW_SECONDS = 30
 
-    This lets us send one batch of observations per rally to the LLM,
-    instead of one frame at a time (which would have no context) or
-    the whole video at once (which would mix unrelated rallies together).
+
+def group_observations_by_window(observations: list, window_seconds: float = WINDOW_SECONDS) -> list:
+    """
+    Splits a flat list of observation dicts (from vision_agent.analyze_video)
+    into consecutive time windows of at most window_seconds each.
+
+    The tool is built for short clips, so a clip up to window_seconds long
+    comes back as a single "whole clip" window. Longer clips are cut purely
+    by time — no shuttle or rally detection involved.
 
     Args:
-        observations: List of observation dicts, each with a "rally_id" key
+        observations: List of observation dicts, each with a "timestamp" key
 
     Returns:
-        Dict mapping rally_id -> list of observation dicts, e.g.
-        {1: [obs1, obs2, ...], 2: [obs1, obs2, ...]}
+        List of (label, observations) pairs in time order, e.g.
+        [("whole clip", [...])] or [("0-30s", [...]), ("30-60s", [...])]
     """
 
-    rallies = {}
+    if not observations:
+        return []
 
-    for obs in observations:
-        rally_id = obs.get("rally_id")
+    end = max(obs["timestamp"] for obs in observations)
+    if end <= window_seconds:
+        return [("whole clip", list(observations))]
 
-        if rally_id not in rallies:
-            rallies[rally_id] = []
+    windows = []
+    start = 0.0
+    while start <= end:
+        stop = start + window_seconds
+        chunk = [obs for obs in observations if start <= obs["timestamp"] < stop]
+        if chunk:
+            windows.append((f"{int(start)}-{int(stop)}s", chunk))
+        start = stop
 
-        rallies[rally_id].append(obs)
-
-    return rallies
+    return windows
 
 
 # ============================================================
@@ -138,7 +148,7 @@ def format_observations_for_prompt(observations: list) -> str:
         t=4.3s: elbow angle is 110.8°, knee angle is 138.1°, shuttle detected this frame
 
     Args:
-        observations: List of observation dicts for ONE rally
+        observations: List of observation dicts for ONE time window
 
     Returns:
         Multi-line string, one line per observation
@@ -160,18 +170,18 @@ def format_observations_for_prompt(observations: list) -> str:
 
 def translate_observations_to_queries(observations: list) -> list:
     """
-    Sends one rally's worth of observations to the LLM and asks it to
+    Sends one time window's worth of observations to the LLM and asks it to
     generate search queries based on any notable patterns it sees.
 
     Args:
-        observations: List of observation dicts for ONE rally
+        observations: List of observation dicts for ONE time window
 
     Returns:
         List of search query strings (in coaching language). Empty list
         if the LLM call fails or returns something that isn't valid JSON.
     """
 
-    # Build the text block describing this rally's observations
+    # Build the text block describing this window's observations
     observations_text = format_observations_for_prompt(observations)
 
     # Fill in the prompt template
@@ -218,15 +228,15 @@ def translate_observations_to_queries(observations: list) -> list:
 # STEP 4: RETRIEVE COACHING FACTS FOR ONE RALLY
 # ============================================================
 
-def retrieve_knowledge_for_rally(observations: list) -> dict:
+def retrieve_knowledge_for_segment(observations: list) -> dict:
     """
-    Full pipeline for one rally:
-      1. Translate the rally's observations into search queries (LLM call)
+    Full pipeline for one time window:
+      1. Translate the window's observations into search queries (LLM call)
       2. Run each query against the ChromaDB knowledge base
       3. Return a dict mapping each query to its retrieved coaching facts
 
     Args:
-        observations: List of observation dicts for ONE rally
+        observations: List of observation dicts for ONE time window
 
     Returns:
         Dict like:
@@ -236,7 +246,7 @@ def retrieve_knowledge_for_rally(observations: list) -> dict:
         }
     """
 
-    # Step 1: generate search queries from the pose patterns in this rally
+    # Step 1: generate search queries from the pose patterns in this window
     queries = translate_observations_to_queries(observations)
 
     # Step 2: retrieve coaching facts for each query
@@ -267,18 +277,18 @@ if __name__ == "__main__":
     # Step 1: get pose observations from the Vision Agent
     observations = analyze_video(UNIFIED_DATA_PATH, racket_arm=RACKET_ARM)
 
-    # Step 2: group observations by rally
-    rallies = group_observations_by_rally(observations)
-    print(f"\nFound {len(rallies)} rally(s)")
+    # Step 2: split observations into time windows
+    windows = group_observations_by_window(observations)
+    print(f"\nSplit into {len(windows)} window(s)")
 
-    # Step 3: for each rally, translate observations into queries and
+    # Step 3: for each window, translate observations into queries and
     # retrieve matching coaching facts
-    for rally_id, rally_observations in rallies.items():
+    for label, window_observations in windows:
         print(f"\n{'=' * 60}")
-        print(f"RALLY {rally_id} — {len(rally_observations)} sampled frames")
+        print(f"{label.upper()} — {len(window_observations)} sampled frames")
         print('=' * 60)
 
-        results = retrieve_knowledge_for_rally(rally_observations)
+        results = retrieve_knowledge_for_segment(window_observations)
 
         for query, facts in results.items():
             print(f"\nQUERY: {query}")

@@ -22,10 +22,15 @@ from ultralytics import YOLO
 # "yolov8n.pt" is the model weights file — downloads automatically on first run
 yolo_model = YOLO("yolov8n.pt")
 
-# Path to the downloaded pose landmarker model bundle (Tasks API)
+# Path to the downloaded pose landmarker model bundle (Tasks API).
+# MediaPipe offers lite, full and heavy versions. On footage shot from behind
+# the player, "full" tracks the racket arm noticeably better than "lite"
+# (wrist visibility >= 0.5 in 37% of frames vs 20%) at the same speed;
+# "heavy" is slower and no better. Download from:
+#   https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task
 POSE_MODEL_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "models", "pose_landmarker_lite.task"
+    "models", "pose_landmarker_full.task"
 )
 
 
@@ -158,7 +163,16 @@ def extract_pose_data(video_path: str, output_json_path: str, player_box: tuple)
     Extracts pose keypoints for every frame, analyzing only the selected player.
     Re-detects the player position every frame so the crop follows the player
     as they move around the court.
-    Saves results as a JSON file with frame index, timestamp, and 33 body landmarks.
+
+    Saves results as a JSON file. Each frame has:
+      - "keypoints": 33 landmarks with x, y, z (fractions of the player crop,
+        as MediaPipe reports them) plus px, py (the same point in full-frame
+        pixels, so it can be compared with the shuttle position)
+      - "world_keypoints": the same 33 landmarks in MediaPipe's 3D "world"
+        coordinates (metres, centred on the hips). Joint angles are measured
+        from these, because the crop is tall and narrow and angles measured
+        from the crop fractions come out distorted.
+      - "crop_box": the full-frame pixel box the crop was taken from
     """
  
     # Opens the video file and gets frames per second to calculate timestamps
@@ -211,7 +225,9 @@ def extract_pose_data(video_path: str, output_json_path: str, player_box: tuple)
 
 
             # Crop the frame to just the selected player's current position
-            cropped_frame, adjusted_box = crop_to_player(frame, last_known_box)
+            cropped_frame, (cx1, cy1, cx2, cy2) = crop_to_player(frame, last_known_box)
+            crop_w = cx2 - cx1
+            crop_h = cy2 - cy1
 
             # MediaPipe requires RGB, OpenCV loads BGR
             rgb_frame = cv2.cvtColor(cropped_frame, cv2.COLOR_BGR2RGB)
@@ -220,8 +236,9 @@ def extract_pose_data(video_path: str, output_json_path: str, player_box: tuple)
             # Run pose detection on the cropped player region
             result = landmarker.detect(mp_image)
 
-            # Empty list to store keypoints for this frame
+            # Empty lists to store keypoints for this frame
             keypoints = []
+            world_keypoints = []
 
             # Only extract keypoints if a person was detected
             if result.pose_landmarks:
@@ -231,19 +248,37 @@ def extract_pose_data(video_path: str, output_json_path: str, player_box: tuple)
                 # itself a list of 33 body landmarks
                 for landmark in result.pose_landmarks[0]:
 
-                    # x, y, z are fractions of the cropped region (0.0-1.0), not pixel coordinates
+                    # x, y, z are fractions of the cropped region (0.0-1.0).
+                    # px, py convert them to full-frame pixels using the crop box.
                     keypoints.append({
                         "x": landmark.x,
                         "y": landmark.y,
                         "z": landmark.z,
-                        "visibility": landmark.visibility
+                        "visibility": landmark.visibility,
+                        "px": round(cx1 + landmark.x * crop_w, 1),
+                        "py": round(cy1 + landmark.y * crop_h, 1),
                     })
+
+                # World landmarks are in metres relative to the hips and are
+                # not affected by the crop's shape. They carry no useful
+                # visibility of their own, so reuse the image landmark's.
+                if result.pose_world_landmarks:
+                    for landmark, image_landmark in zip(result.pose_world_landmarks[0],
+                                                        result.pose_landmarks[0]):
+                        world_keypoints.append({
+                            "x": landmark.x,
+                            "y": landmark.y,
+                            "z": landmark.z,
+                            "visibility": image_landmark.visibility,
+                        })
 
             all_frames.append({
                 "frame": frame_index,
                 # Convert frame number to seconds using fps
                 "timestamp": round(frame_index / fps, 3),
-                "keypoints": keypoints
+                "keypoints": keypoints,
+                "world_keypoints": world_keypoints,
+                "crop_box": [int(cx1), int(cy1), int(cx2), int(cy2)],
             })
             frame_index += 1
     finally:

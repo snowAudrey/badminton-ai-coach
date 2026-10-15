@@ -8,8 +8,9 @@ venv/
 # Environment variables (never commit this)
 .env
 
-# Large files — store locally only
-data/
+# Large files — store locally only (data/labels/ is small ground truth and IS tracked)
+data/*
+!data/labels/
 outputs/
 models/
 *.mp4

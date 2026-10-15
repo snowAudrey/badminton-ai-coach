@@ -142,7 +142,7 @@
 
   <section>
     <h2>Demo</h2>
-    <p class="section-lede">One command takes a raw clip to per-rally coaching feedback: select the player to analyze with a click, and the pipeline does the rest.</p>
+    <p class="section-lede">One command takes a raw clip to timestamped coaching feedback: select the player to analyze with a click, and the pipeline does the rest.</p>
     <video src="assets/demo.mp4" controls muted playsinline preload="metadata"></video>
     <p class="caption">Real, uncut input and output — only about a minute of processing in the middle is trimmed for brevity.</p>
   </section>
@@ -161,7 +161,7 @@
           <p><span class="t">Around t=7.6s–7.9s,</span> with wrist below shoulder and very extended elbow (171–174°): this appears to be a lift or low defensive shot. Ensure you're lifting with height to give your partner time to recover; lifting flat onto the strings makes it easier for your opponent to attack. Your knee angle here (135–145°) shows some bend, which is good for control, but commit to driving through with height.</p>
           <p><span class="t">Around t=9.4s–9.9s</span> (overhead position with shuttle contact): this could be a clear, smash, or drop shot. If a smash: your elbow angle changes sharply from 47° to 174° — keep your elbow back longer during the early preparation to stretch your chest before explosive acceleration, rather than extending it so quickly. Also ensure you rotate your whole forearm and wrist together at the end for maximum power, not just the lower forearm.</p>
         </div>
-        <p class="caption">Feedback excerpt from the same rally — generated, not hand-written</p>
+        <p class="caption">Feedback excerpt from the same clip — generated, not hand-written</p>
       </div>
     </div>
   </section>
@@ -172,12 +172,12 @@
       <div class="step">
         <span class="num">1</span>
         <h3>See</h3>
-        <p>YOLOv8 detects the players and a custom-trained model tracks the shuttlecock. MediaPipe extracts 33 body keypoints per frame for the selected player, and shuttle movement segments the clip into rallies.</p>
+        <p>YOLOv8 detects the players and a custom-trained model tracks the shuttlecock. MediaPipe extracts 33 body keypoints per frame for the selected player.</p>
       </div>
       <div class="step">
         <span class="num">2</span>
         <h3>Retrieve</h3>
-        <p>Claude reads the rally's joint-angle and wrist-height patterns and turns them into search queries against a knowledge base of ~2,900 coaching facts extracted from 165 tutorial videos (ChromaDB).</p>
+        <p>Claude reads the clip's joint-angle and wrist-height patterns and turns them into search queries against a knowledge base of ~2,900 coaching facts extracted from 165 tutorial videos (ChromaDB).</p>
       </div>
       <div class="step">
         <span class="num">3</span>

@@ -1,3 +1,5 @@
+import json
+import os
 import time
 
 import anthropic
@@ -8,16 +10,17 @@ from dotenv import load_dotenv
 # analyze_video() turns CV pipeline output into pose observations
 from src.agents.vision_agent import analyze_video
 
-# group_observations_by_rally() splits observations into per-rally batches
-# format_observations_for_prompt() turns one rally's observations into a
+# group_observations_by_window() splits observations into time windows of
+#   up to 30 seconds (one Claude call per window)
+# format_observations_for_prompt() turns one window's observations into a
 #   readable text block — reused here so the synthesis prompt describes
 #   pose data the same way the translation prompt does
-# retrieve_knowledge_for_rally() runs the translation + retrieval steps
-#   (LLM call 1 + ChromaDB search) for one rally
+# retrieve_knowledge_for_segment() runs the translation + retrieval steps
+#   (LLM call 1 + ChromaDB search) for one window
 from src.agents.knowledge_agent import (
-    group_observations_by_rally,
+    group_observations_by_window,
     format_observations_for_prompt,
-    retrieve_knowledge_for_rally
+    retrieve_knowledge_for_segment
 )
 
 
@@ -41,8 +44,8 @@ API_DELAY_SECONDS = 0.5
 # ============================================================
 # SYNTHESIS PROMPT
 # ============================================================
-# This prompt is step 2 of the bridge: it takes one rally's raw pose
-# observations AND the coaching facts retrieved for that rally (via
+# This prompt is step 2 of the bridge: it takes one window's raw pose
+# observations AND the coaching facts retrieved for that window (via
 # knowledge_agent.py) and asks the LLM to write grounded feedback.
 #
 # Unlike the translation step, this prompt is told to stay grounded in
@@ -50,10 +53,10 @@ API_DELAY_SECONDS = 0.5
 # the retrieved facts are the only thing that should drive the content of
 # the feedback.
 
-SYNTHESIS_PROMPT = """You are a badminton coach reviewing one rally from a match video.
+SYNTHESIS_PROMPT = """You are a badminton coach reviewing a short stretch (up to 30 seconds) of a match clip.
 
 Below are two things:
-1. A sequence of pose observations sampled across the rally, with timestamps.
+1. A sequence of pose observations sampled across that stretch, with timestamps.
 2. Coaching facts retrieved from a badminton knowledge base, based on patterns
    noticed in those observations.
 
@@ -159,13 +162,13 @@ def format_knowledge_for_prompt(retrieved_knowledge: dict) -> str:
 
 def synthesize_feedback(observations: list, retrieved_knowledge: dict) -> str:
     """
-    Sends one rally's pose observations and retrieved coaching facts to the
+    Sends one window's pose observations and retrieved coaching facts to the
     LLM and asks it to write grounded, timestamped feedback for the player.
 
     Args:
-        observations: List of observation dicts for ONE rally
+        observations: List of observation dicts for ONE time window
         retrieved_knowledge: Dict mapping queries to retrieved fact lists,
-                              from knowledge_agent.retrieve_knowledge_for_rally()
+                              from knowledge_agent.retrieve_knowledge_for_segment()
 
     Returns:
         Feedback text written by the LLM. Empty string if the API call fails.
@@ -205,43 +208,67 @@ def synthesize_feedback(observations: list, retrieved_knowledge: dict) -> str:
 # STEP 3: RUN THE FULL PIPELINE
 # ============================================================
 
-def run_pipeline(unified_data_path: str, racket_arm: str = "right") -> dict:
+def _save_json(path: str, data) -> None:
+    """Writes data as readable JSON, creating the folder if needed."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def run_pipeline(unified_data_path: str, racket_arm: str = "right",
+                 video_path: str = None, output_dir: str = "outputs") -> dict:
     """
-    Runs the full pipeline end to end, one rally at a time:
+    Runs the full pipeline end to end, one time window at a time:
       1. vision_agent.analyze_video() — CV data -> pose observations
-      2. knowledge_agent.group_observations_by_rally() — split by rally
-      3. knowledge_agent.retrieve_knowledge_for_rally() — LLM call 1 + retrieval
+      2. knowledge_agent.group_observations_by_window() — split into windows of up to 30s
+      3. knowledge_agent.retrieve_knowledge_for_segment() — LLM call 1 + retrieval
       4. synthesize_feedback() — LLM call 2 -> final feedback text
+
+    Everything Claude was given is also saved, so the feedback can be checked:
+      <output_dir>/observations.json       the pose observations
+      <output_dir>/queries_and_facts.json  the search queries and the facts they found
+      <output_dir>/feedback.json           the final feedback per window
 
     Args:
         unified_data_path: Path to unified_data.json from the CV pipeline
-        racket_arm: "right" or "left" — player's racket arm side
+        racket_arm: "right" or "left" — the player's racket arm
+        video_path: The clip the data came from (for the racket-arm check image)
+        output_dir: Folder for the saved results
 
     Returns:
-        Dict mapping rally_id -> feedback text for that rally
+        Dict mapping window label (e.g. "whole clip" or "0-30s") -> feedback text
     """
 
     # Step 1: get pose observations from the Vision Agent
-    observations = analyze_video(unified_data_path, racket_arm=racket_arm)
+    observations = analyze_video(unified_data_path, racket_arm=racket_arm,
+                                 video_path=video_path, output_dir=output_dir)
 
-    # Step 2: group observations by rally
-    rallies = group_observations_by_rally(observations)
+    # Step 2: split observations into time windows
+    windows = group_observations_by_window(observations)
 
-    # Step 3 + 4: for each rally, retrieve knowledge and synthesize feedback
-    feedback_by_rally = {}
+    # Step 3 + 4: for each window, retrieve knowledge and synthesize feedback
+    feedback_by_window = {}
+    queries_and_facts = {}
 
-    for rally_id, rally_observations in rallies.items():
-        print(f"\nProcessing rally {rally_id} ({len(rally_observations)} sampled frames)...")
+    for label, window_observations in windows:
+        print(f"\nProcessing {label} ({len(window_observations)} sampled frames)...")
 
-        retrieved_knowledge = retrieve_knowledge_for_rally(rally_observations)
+        retrieved_knowledge = retrieve_knowledge_for_segment(window_observations)
+        queries_and_facts[label] = retrieved_knowledge
 
-        feedback = synthesize_feedback(rally_observations, retrieved_knowledge)
-        feedback_by_rally[rally_id] = feedback
+        feedback = synthesize_feedback(window_observations, retrieved_knowledge)
+        feedback_by_window[label] = feedback
 
-        # Small delay before moving to the next rally
+        # Small delay before moving to the next window
         time.sleep(API_DELAY_SECONDS)
 
-    return feedback_by_rally
+    # Save what Claude saw and what it wrote
+    _save_json(os.path.join(output_dir, "observations.json"), observations)
+    _save_json(os.path.join(output_dir, "queries_and_facts.json"), queries_and_facts)
+    _save_json(os.path.join(output_dir, "feedback.json"), feedback_by_window)
+    print(f"\nSaved observations, queries/facts and feedback → {output_dir}/")
+
+    return feedback_by_window
 
 
 # ============================================================
@@ -253,15 +280,18 @@ if __name__ == "__main__":
     # Path to your unified data — same as vision_agent.py and knowledge_agent.py
     UNIFIED_DATA_PATH = "outputs/unified_data.json"
 
+    # The clip the data came from — used for the racket-arm check image
+    VIDEO_PATH = "data/test_clip.MOV"
+
     # Change to "left" if the player is left-handed
     RACKET_ARM = "right"
 
     # Run the full pipeline
-    feedback_by_rally = run_pipeline(UNIFIED_DATA_PATH, racket_arm=RACKET_ARM)
+    feedback_by_window = run_pipeline(UNIFIED_DATA_PATH, racket_arm=RACKET_ARM, video_path=VIDEO_PATH)
 
-    # Print the final feedback for each rally
-    for rally_id, feedback in feedback_by_rally.items():
+    # Print the final feedback for each window
+    for label, feedback in feedback_by_window.items():
         print(f"\n{'=' * 60}")
-        print(f"FEEDBACK FOR RALLY {rally_id}")
+        print(f"FEEDBACK — {label}")
         print('=' * 60)
         print(feedback)

@@ -4,7 +4,7 @@ import cv2
 # Import all four functions from shuttle_tracker
 # "from src.vision.shuttle_tracker" tells Python where to find the file
 # src/ → vision/ → shuttle_tracker.py
-from src.vision.shuttle_tracker import detect_shuttle, get_shuttle_positions, get_rally_segments, visualize_shuttle
+from src.vision.shuttle_tracker import detect_shuttle, get_shuttle_positions, visualize_shuttle
 
 # ============================================================
 # IMPORTANT: Update this to match your actual video filename
@@ -78,34 +78,7 @@ for entry in shuttle_positions[:3]:
 
 
 # ============================================================
-# STEP 3: Test get_rally_segments()
-# Goal: confirm the function groups frames into rally segments
-#
-# What to check:
-#   - It prints a list of rallies with start/end times
-#   - With low shuttle detection (from the general model), may get 0 rallies
-#     or very short/noisy ones — that is expected and will improve with better weights
-# ============================================================
-
-# Pass the shuttle positions into the rally segmentation function
-# This doesn't need the video — it works purely from the position data
-cap = cv2.VideoCapture(VIDEO_PATH)
-fps = cap.get(cv2.CAP_PROP_FPS)
-cap.release()
-rallies = get_rally_segments(shuttle_positions, fps)
-
-# Print a summary of what was found
-print(f"Total rallies found: {len(rallies)}")
-
-# Print each rally's details
-for rally in rallies:
-    print(f"  Rally {rally['rally_id']}: "
-          f"{rally['start_time']}s → {rally['end_time']}s  "
-          f"({rally['frame_count']} frames)")
-
-
-# ============================================================
-# STEP 4: Test visualize_shuttle()
+# STEP 3: Test visualize_shuttle()
 # Goal: save an annotated video for visually checking detection quality
 #
 # What to check:
