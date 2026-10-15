@@ -12,12 +12,14 @@ The project has two pipelines: a computer vision pipeline that turns video into 
 
 **1. Computer vision pipeline** (`src/vision/`)
 - `pose_estimator.py` — YOLOv8 detects players in the first frame; you click to select which player to track. MediaPipe Pose then extracts 33 body keypoints per frame, re-detecting and re-cropping to the selected player every frame so tracking survives camera motion and multiple players in frame.
-- `shuttle_tracker.py` — a custom-trained YOLOv8 model (fine-tuned on 8,000+ labeled frames) detects the shuttlecock per frame, then groups frames into rally segments based on shuttle movement.
-- `pipeline.py` — merges pose, shuttle, and rally data into one frame-indexed JSON (`unified_data.json`).
+- `shuttle_tracker.py` — a custom-trained YOLOv8 model (fine-tuned on 8,000+ labeled frames) detects the shuttlecock per frame and filters out static background objects that look like a shuttle.
+- `pipeline.py` — merges pose and shuttle data into one frame-indexed JSON (`unified_data.json`).
+- `shot_events.py` — finds each shot from the racket wrist's speed (measured relative to the shoulders, so running doesn't count), and records facts about it: wrist height before and at the swing, elbow and knee angles, how high the shuttle climbed afterwards, how fast it was coming in, and the pause since the previous shot (`shot_events.json`).
 
 **2. Coaching agent pipeline** (`src/agents/`)
-- `vision_agent.py` — converts raw keypoints into human-readable pose facts per sampled frame (elbow/knee angle, wrist height relative to head and shoulder, shuttle presence) — descriptive only, no judgment about whether an angle is "good."
-- `knowledge_agent.py` — sends a rally's pose observations to Claude, which spots notable angle/height-change patterns and translates them into badminton-specific search queries, then retrieves matching coaching facts from a ChromaDB knowledge base.
+- `shot_classifier.py` — names each shot (smash, clear, drop, drive, net shot, lift, block/defence, serve, return of serve) with rules on those facts: contact height decides overhead vs. underarm, the shuttle's climb separates clear/lift from drop/net shot, a fast incoming shuttle returned with a short action is a block, a long pause with nothing incoming is a serve. Claude can be asked instead (`--use-claude`, with video frames), but on phone footage the shuttle is too small to see in the frames and it guessed, so the rules are the default.
+- `vision_agent.py` — keeps MediaPipe's left/right labels consistent across frames (they can flip on footage shot from behind) and saves a check image of the arm being measured, then converts raw keypoints into human-readable pose facts per sampled frame (elbow/knee angle measured from MediaPipe's 3D landmarks, wrist height relative to head and shoulder, shuttle presence) — descriptive only, no judgment about whether an angle is "good."
+- `knowledge_agent.py` — sends the clip's pose observations (in windows of up to 30 seconds) to Claude, which spots notable angle/height-change patterns and translates them into badminton-specific search queries, then retrieves matching coaching facts from a ChromaDB knowledge base.
 - `orchestrator.py` — sends the pose observations and retrieved coaching facts to Claude again, which synthesizes grounded, timestamped feedback — naming multiple plausible shot types when the retrieved facts don't clearly point to one, rather than guessing confidently.
 
 **3. Offline knowledge base build** (`src/knowledge/`, run once — not part of the per-video pipeline)
@@ -43,7 +45,7 @@ Python · OpenCV · YOLOv8 · MediaPipe · NumPy · Google Colab · Claude API �
    (Your `.env` file is protected by `.gitignore` and will never be pushed to GitHub.)
 3. Place model files in `models/` (not included in this repo — see `.gitignore`):
    - `best.pt` — custom-trained shuttlecock detector
-   - `pose_landmarker_lite.task` — MediaPipe pose landmarker model
+   - `pose_landmarker_full.task` — MediaPipe pose landmarker model ([download](https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task)); the lite version tracks the racket arm noticeably worse from behind
 
    (`yolov8n.pt`, used for player detection, downloads automatically on first run.)
 4. Build the coaching knowledge base once (only needed the first time, or after regenerating `coaching_facts_full.json`):
@@ -57,11 +59,11 @@ Python · OpenCV · YOLOv8 · MediaPipe · NumPy · Google Colab · Claude API �
 python main.py --video path/to/your/match.mp4 --racket-arm right
 ```
 
-This runs the full pipeline — player selection, pose/shuttle/rally extraction, and coaching feedback synthesis — and prints timestamped feedback per rally.
+This runs the full pipeline — player selection, pose/shuttle extraction, shot detection and naming, and coaching feedback synthesis — and prints timestamped feedback. It also saves the detected shots (`outputs/shot_events.json`), what Claude was given (`outputs/observations.json`, `outputs/queries_and_facts.json`) and what it wrote (`outputs/feedback.json`).
 
 Flags:
 - `--video` (required) — path to the match video
-- `--racket-arm` — `right` or `left` (default: `right`)
+- `--racket-arm` — `right` or `left` (default: `right`). Afterwards, open `outputs/racket_arm_check.jpg` and confirm the yellow arm is your racket arm — MediaPipe can mirror left and right on footage shot from behind
 - `--output-dir` — where intermediate files are saved (default: `outputs`)
 
 ## Example output
@@ -78,13 +80,19 @@ through -- avoid only rotating the bottom half of your forearm, which
 reduces power.
 ```
 
+## Measuring accuracy
+
+Hand-label the shots in a clip with `python scripts/label_shots.py --video data/<clip>.MOV` (see `data/labels/README.md`), then score a run with `python scripts/evaluate.py --labels data/labels/<clip>.csv`. Results append to `outputs/eval_history.csv`.
+
+On the first labelled clip (34 s, 10 shots): all 10 shots found within ±0.5 s with 1 false detection, and all 10 named correctly — but the rules were tuned on that clip, so this is a fit, not an independent test. More labelled clips are needed.
+
 ## Current status and known limitations
 
 - Tested on clips of ~15-34 seconds so far — longer videos, even within the intended under-1-minute range, are untested
 - Pose detection: 100% of frames on self-recorded test footage
 - Shuttle detection: ~19% of frames on amateur footage — lower than the 0.608 mAP50 the underlying model achieves on its own validation set, since real-world amateur footage (lighting, background clutter, camera angle) is harder than the training distribution. Improving this is planned as its own follow-up project.
-- Shot-type identification is inherently ambiguous from pose data alone, with no shuttle trajectory or court-position context yet, so feedback deliberately names multiple plausible shot types rather than guessing confidently.
-- Rally segmentation relies on a fixed stillness threshold (`RALLY_END_FRAMES`, currently 3 seconds) tuned to the original test clip's pacing — longer natural pauses between points in other footage can cause rallies to be split or merged incorrectly, so this threshold may need retuning per video.
+- Shot naming relies on the shuttle being detected during its flight; when it isn't (≈19% detection rate), overhead shots fall back to a guess between clear and drop based on swing speed, with low confidence. Smashes can't yet be told from clears or drops without the flight. Forehand vs backhand is not identified yet.
+- Shot naming rules were tuned on one labelled clip and have not been validated on others yet.
 - Shuttle detection depends on the camera's shooting angle — on footage where overhead space isn't well captured, shots hit high (e.g. clears, lifts) can go undetected entirely, independent of the model's accuracy.
 - Search query generation is non-deterministic — a plausible shot type (e.g. drop shot alongside clear and smash for an overhead pattern) can occasionally be left out of a given run's split between multiple shot types, even though the underlying prompt asks for full coverage.
 
