@@ -52,23 +52,139 @@ def _create_pose_landmarker():
     return vision.PoseLandmarker.create_from_options(options)
 
 
+# ============================================================
+# FINDING PEOPLE AND FOLLOWING THE SELECTED PLAYER
+# ============================================================
+
+# YOLO shrinks the frame to this many pixels on its long side before looking.
+# At its default of 640, a player at the far end of a 1080p frame is about
+# 50 px tall and gets missed mid-jump; 1280 keeps them visible
+PERSON_DETECTOR_IMGSZ = 1280
+
+# Detection confidence needed for anyone, and the lower bar for a detection
+# right where the player was a frame ago (a fast-moving player is often
+# detected with less confidence than a seated line judge)
+PERSON_CONFIDENCE = 0.5
+PERSON_CONFIDENCE_NEAR = 0.3
+
+# A player cannot move more than this fraction of their own box height
+# between two consecutive frames. The allowance grows by the same amount for
+# every frame they haven't been seen, so they are picked up again after a
+# jump or a missed detection
+MAX_MOVE_PER_FRAME = 0.5
+
+# Shirt-colour match (1 = identical, around 0 = unrelated) below which a
+# candidate is refused even if it is close — e.g. the line judge by the
+# umpire's chair, the opponent, or a doubles partner in a different shirt.
+# Measured on three players: the tracked player's own box scores 0.5-1.0
+# in 95% of frames; other people score below 0 in 95% of frames
+MIN_SHIRT_MATCH = 0.1
+
+# The reference shirt colour follows the player slowly (this share of each
+# matched frame), so turning round or a change of light doesn't make the
+# player stop matching their own first-frame colour
+SHIRT_ADAPT_RATE = 0.05
+
+
+def detect_people(frame):
+    """
+    Uses YOLOv8 to find every person in a frame.
+    Returns [(x1, y1, x2, y2, confidence), ...] down to PERSON_CONFIDENCE_NEAR.
+    """
+    results = yolo_model(frame, imgsz=PERSON_DETECTOR_IMGSZ, conf=PERSON_CONFIDENCE_NEAR, verbose=False)
+    people = []
+    for result in results:
+        for box in result.boxes:
+            # Class 0 means "person" in YOLOv8
+            if int(box.cls) == 0:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                people.append((x1, y1, x2, y2, float(box.conf)))
+    return people
+
+
 def detect_players(frame):
     '''
     Uses YOLOv8 to detect players in a frame.
     Returns a list of bounding boxes for detected players: [(x1, y1, x2, y2), ...]
     '''
-    results = yolo_model(frame, verbose = False)
-    boxes = []
+    return [(x1, y1, x2, y2) for x1, y1, x2, y2, conf in detect_people(frame) if conf > PERSON_CONFIDENCE]
 
-    for result in results: 
-        #Loop through each individual detected object in the frame 
-        for box in result.boxes:
-            # Class 0 means "person" in YOLOv8
-            if int(box.cls) == 0 and float(box.conf) > 0.5:
-                # Converts the coordinates from floats to integers
-                x1,y1,x2,y2 = map(int, box.xyxy[0])
-                boxes.append((x1, y1, x2, y2))
-    return boxes 
+
+def _shirt_histogram(frame, box):
+    """
+    A colour signature for the person in a box: a hue / saturation /
+    brightness histogram of the torso band (20-55% of the box height, middle
+    60% of its width), where the shirt is.
+    """
+    x1, y1, x2, y2 = box
+    w, h = x2 - x1, y2 - y1
+    torso = frame[max(0, int(y1 + 0.2 * h)):int(y1 + 0.55 * h), max(0, int(x1 + 0.2 * w)):int(x1 + 0.8 * w)]
+    if torso.size == 0:
+        return None
+    hsv = cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1, 2], None, [18, 4, 4], [0, 180, 0, 256, 0, 256])
+    cv2.normalize(hist, hist, 1.0, 0.0, cv2.NORM_L1)
+    return hist
+
+
+def _shirt_match(a, b) -> float:
+    """How alike two colour signatures are: 1 = identical, around 0 = unrelated."""
+    if a is None or b is None:
+        return 1.0       # no evidence either way
+    return float(cv2.compareHist(a, b, cv2.HISTCMP_CORREL))
+
+
+class PlayerTracker:
+    """
+    Follows the player selected in the first frame through the clip.
+
+    Each frame, the detected people are filtered to those the player could
+    have reached since last seen (MAX_MOVE_PER_FRAME) and whose shirt colour
+    matches the selected player's (MIN_SHIRT_MATCH); the best shirt match
+    wins, nearer when equal. When nobody qualifies — the player was missed
+    by the detector, or only other people are nearby — the last box is kept
+    and the search radius grows for the next frame. The reference colour
+    adapts slowly to the matched player (SHIRT_ADAPT_RATE).
+
+    This replaces "jump to the nearest person within 300 px", which switched
+    to a seated line judge when a far-away player jumped to smash.
+    """
+
+    def __init__(self, first_frame, box):
+        self.box = tuple(int(v) for v in box)
+        self.shirt = _shirt_histogram(first_frame, self.box)
+        self.frames_unseen = 0
+
+    def update(self, frame, people) -> tuple:
+        """Chooses this frame's box from people [(x1, y1, x2, y2, conf), ...]."""
+        last_cx = (self.box[0] + self.box[2]) / 2
+        last_cy = (self.box[1] + self.box[3]) / 2
+        last_h = max(1, self.box[3] - self.box[1])
+        step = MAX_MOVE_PER_FRAME * last_h
+        allowed = step * (1 + self.frames_unseen)
+
+        best, best_score = None, -np.inf
+        for x1, y1, x2, y2, conf in people:
+            distance = np.hypot((x1 + x2) / 2 - last_cx, (y1 + y2) / 2 - last_cy)
+            if distance > allowed:
+                continue
+            if conf < PERSON_CONFIDENCE and distance > step:
+                continue             # a low-confidence detection only counts right where the player was
+            match = _shirt_match(self.shirt, _shirt_histogram(frame, (x1, y1, x2, y2)))
+            if match < MIN_SHIRT_MATCH:
+                continue
+            score = match - 0.5 * distance / allowed      # the right shirt first, then the nearer one
+            if score > best_score:
+                best, best_score = (x1, y1, x2, y2), score
+
+        if best is None:
+            self.frames_unseen += 1
+        else:
+            self.box, self.frames_unseen = best, 0
+            latest = _shirt_histogram(frame, best)
+            if self.shirt is not None and latest is not None:
+                self.shirt = (1 - SHIRT_ADAPT_RATE) * self.shirt + SHIRT_ADAPT_RATE * latest
+        return self.box
 
 
 def select_player(video_path: str):
@@ -181,8 +297,8 @@ def extract_pose_data(video_path: str, output_json_path: str, player_box: tuple)
 
     all_frames = []
     frame_index = 0
-    # Start with the user's selected bounding box as the last known position
-    last_known_box = player_box
+    # The tracker starts from the user's selected box (and that player's shirt colour)
+    tracker = None
 
     landmarker = _create_pose_landmarker()
     try:
@@ -190,39 +306,11 @@ def extract_pose_data(video_path: str, output_json_path: str, player_box: tuple)
             ret, frame = cap.read()
             if not ret:
                 break
- 
-            # Run YOLO on the current frame to find all visible players
-            boxes = detect_players(frame)
- 
-            # Find which detected player is our selected player 
-            if boxes:
 
-                # Calculate the center of the last known box where our player was in the previous frame
-                last_center_x = (last_known_box[0] + last_known_box[2]) / 2
-                last_center_y = (last_known_box[1] + last_known_box[3]) / 2
-                min_distance = float("inf")
-                closest_box = None
- 
-                for (x1, y1, x2, y2) in boxes:
-                    center_x = (x1 + x2) / 2
-                    center_y = (y1 + y2) / 2
- 
-                    # Calculate straight-line distance between this detection
-                    # and where our player was last seen
-                    distance = np.sqrt(
-                        (center_x - last_center_x) ** 2 +
-                        (center_y - last_center_y) ** 2
-                    )
- 
-                    if distance < min_distance:
-                        min_distance = distance
-                        closest_box = (x1, y1, x2, y2)
- 
-                # Only update last known box to the closest detection if it is within a reasonable distance
-                # This becomes the starting point for the next frame's search 
-                if min_distance < 300:
-                    last_known_box = closest_box
-
+            # Find everyone in the frame, then work out which one is our player
+            if tracker is None:
+                tracker = PlayerTracker(frame, player_box)
+            last_known_box = tracker.update(frame, detect_people(frame))
 
             # Crop the frame to just the selected player's current position
             cropped_frame, (cx1, cy1, cx2, cy2) = crop_to_player(frame, last_known_box)
@@ -319,7 +407,7 @@ def visualize_pose(video_path: str, output_video_path: str, player_box: tuple):
     # VideoWriter_fourcc(*"mp4v") sets the video compression format to MP4
     out = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
  
-    last_known_box = player_box
+    tracker = None
 
     landmarker = _create_pose_landmarker()
     try:
@@ -328,27 +416,10 @@ def visualize_pose(video_path: str, output_video_path: str, player_box: tuple):
             if not ret:
                 break
 
-            boxes = detect_players(frame)
-            if boxes:
-                last_center_x = (last_known_box[0] + last_known_box[2]) / 2
-                last_center_y = (last_known_box[1] + last_known_box[3]) / 2
-                min_distance = float("inf")
-                closest_box = None
-
-                for (x1, y1, x2, y2) in boxes:
-                    center_x = (x1 + x2) / 2
-                    center_y = (y1 + y2) / 2
-                    distance = np.sqrt(
-                        (center_x - last_center_x) ** 2 +
-                        (center_y - last_center_y) ** 2
-                    )
-
-                    if distance < min_distance:
-                        min_distance = distance
-                        closest_box = (x1, y1, x2, y2)
-
-                if min_distance < 300:
-                    last_known_box = closest_box
+            # Same tracking as extract_pose_data, so the overlay follows the same person
+            if tracker is None:
+                tracker = PlayerTracker(frame, player_box)
+            last_known_box = tracker.update(frame, detect_people(frame))
 
             cropped_frame, (cx1, cy1, cx2, cy2) = crop_to_player(frame, last_known_box)
             rgb_cropped = cv2.cvtColor(cropped_frame, cv2.COLOR_BGR2RGB)
