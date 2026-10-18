@@ -145,8 +145,10 @@ def main():
             row["type_top2"] = round(top2 / len(typed), 3)
             print(f"Shot type correct:     {pct(top1, len(typed))} first guess, {pct(top2, len(typed))} within top two")
 
+            # Only score forehand/backhand where the coach actually committed to one
             sided = [(l, e) for l, e in typed
-                     if (e.get("stroke_side") or e.get("side")) and l.get("side") in ("forehand", "backhand")]
+                     if str(e.get("stroke_side") or e.get("side") or "").lower() in ("forehand", "backhand")
+                     and l.get("side") in ("forehand", "backhand")]
             if sided:
                 ok = sum(1 for l, e in sided if str(e.get("stroke_side") or e.get("side")).lower() == l["side"])
                 row["side_acc"] = round(ok / len(sided), 3)

@@ -7,7 +7,8 @@ player's shoulders (so running around the court doesn't count) and scaled by
 shoulder width (so distance from the camera doesn't matter), spikes during
 a swing. Each spike that stands well above the clip's typical wrist speed,
 and is at least MIN_SHOT_GAP_S from the previous one, is a shot. The speed
-peak is taken as the moment of contact.
+peak is roughly the moment of contact; when the shuttle was seen next to the
+racket around then, the frame where it came closest is used as the contact.
 
 Run on its own:
     python -m src.vision.shot_events
@@ -58,6 +59,34 @@ CONTACT_HEIGHT_LEAD_S = 0.25
 # Stopping at the first gap keeps the opponent's reply out of it.
 FLIGHT_START_WITHIN_S = 1.0
 FLIGHT_MAX_GAP_S = 0.5
+
+# Two consecutive shuttle detections further apart than this (shoulder
+# widths per frame) can't be the same shuttle — even a hard smash moves
+# under 2 per frame — so one of them is a false detection (e.g. a ceiling
+# light) and the sequence is cut there
+MAX_SHUTTLE_JUMP_PER_FRAME = 4.0
+
+# A shuttle in flight cannot suddenly speed up — only a hit does that, and
+# the sequence is walked outward from the hit — so a step more than
+# MAX_SPEED_UP times faster than the previous step is a false detection too.
+# The allowance (shoulder widths per frame) keeps a slow, floating shuttle
+# from being over-constrained
+MAX_SPEED_UP = 3.0
+SPEED_UP_ALLOWANCE_SW = 0.5
+
+# The wrist-speed peak is only roughly the contact: on soft shots the wrist
+# is fastest in the follow-through (a lift) or while reaching for the shuttle
+# (a net shot), up to 0.3 s away. If the shuttle was seen within this many
+# shoulder widths of the racket wrist around the peak, the frame where it
+# came closest is the contact instead. A "shuttle" that never moves at least
+# MIN_FLIGHT_MOVE_SW is a static object, not the shuttle, and is ignored
+CONTACT_RADIUS_SW = 4.0
+MIN_FLIGHT_MOVE_SW = 0.5
+
+# When the detector loses the shuttle while it is still climbing, the climb
+# is extended this long at the last measured rate — the shuttle does not
+# stop when the detector loses sight of it
+LOST_WHILE_CLIMBING_S = 0.1
 
 
 # ============================================================
@@ -223,10 +252,50 @@ def _wrist_side_of_body(frame: dict, side: str) -> float | None:
     return round(float(np.dot(offset, axis / width) / width), 2)
 
 
-def _shuttle_motion(frames: list, start: int, stop: int) -> dict | None:
-    """Where the shuttle went between two frames, if it was detected there."""
+def _plausible_detections(frames: list, start: int, stop: int, shoulder_width: float,
+                          anchor_frame: int = None) -> list:
+    """
+    Shuttle detections in [start, stop) as (frame, x, y), keeping only a chain
+    where each detection is reachable from the last kept one at a plausible
+    speed. The chain is walked outward from the detection nearest
+    anchor_frame (the contact), so a stray false positive far away cannot
+    hijack it; an implausible detection is skipped and the walk goes on.
+    """
     seen = [(f["frame"], f["shuttle_x"], f["shuttle_y"]) for f in frames[max(0, start):stop]
             if f.get("shuttle_detected")]
+    if not seen or shoulder_width <= 0:
+        return seen
+    limit = MAX_SHUTTLE_JUMP_PER_FRAME * shoulder_width
+    allowance = SPEED_UP_ALLOWANCE_SW * shoulder_width
+
+    def step_speed(a, b):
+        """Pixels per frame between two detections (a gap of several frames counts as several)."""
+        gap = abs(b[0] - a[0])
+        return np.hypot(b[1] - a[1], b[2] - a[2]) / gap if gap else np.inf
+
+    pivot = min(range(len(seen)), key=lambda i: abs(seen[i][0] - (anchor_frame if anchor_frame is not None else seen[0][0])))
+
+    def walk(indices):
+        chain, last, previous_speed = [], seen[pivot], None
+        for i in indices:
+            speed = step_speed(last, seen[i])
+            if speed > limit:
+                continue
+            if previous_speed is not None and speed > MAX_SPEED_UP * previous_speed + allowance:
+                continue
+            chain.append(seen[i])
+            last, previous_speed = seen[i], speed
+        return chain
+
+    after = walk(range(pivot + 1, len(seen)))        # forward from the pivot
+    before = walk(range(pivot - 1, -1, -1))          # backward from the pivot
+    return before[::-1] + [seen[pivot]] + after
+
+
+def _shuttle_motion(frames: list, start: int, stop: int, shoulder_width: float = 0.0,
+                    anchor_frame: int = None) -> dict | None:
+    """Where the shuttle went between two frames, if it was detected there."""
+    seen = _plausible_detections(frames, start, stop, shoulder_width, anchor_frame)
     if len(seen) < 2:
         return None
     (f0, x0, y0), (f1, x1, y1) = seen[0], seen[-1]
@@ -251,7 +320,7 @@ def _shuttle_rise_after(frames: list, contact: int, fps: float, head_y: float,
     reply doesn't get mixed in.
     """
     stop = contact + int(round((FLIGHT_START_WITHIN_S + 1.0) * fps)) + 1
-    seen = [(f["frame"], f["shuttle_y"]) for f in frames[contact:stop] if f.get("shuttle_detected")]
+    seen = [(fr, y) for fr, _, y in _plausible_detections(frames, contact, stop, shoulder_width, contact)]
     if not seen or (seen[0][0] - contact) / fps > FLIGHT_START_WITHIN_S or shoulder_width <= 0:
         return None
     # Follow the flight while it is one arc: it may go up (y decreasing) and
@@ -259,21 +328,34 @@ def _shuttle_rise_after(frames: list, contact: int, fps: float, head_y: float,
     # is a new hit — the opponent's reply — so stop there
     run = [seen[0]]
     descending = False
+    lost = True          # the arc ended because the detector lost the shuttle
     for previous, current in zip(seen, seen[1:]):
         if (current[0] - previous[0]) / fps > FLIGHT_MAX_GAP_S:
             break
         if current[1] > previous[1]:
             descending = True
         elif descending and current[1] < previous[1]:
+            lost = False     # it ended because the shuttle went up again (the opponent's hit)
             break
         run.append(current)
     if len(run) < 2:
         return None
     ys = [y for _, y in run]
+    top = min(ys)
+
+    # If the shuttle vanished while still climbing, it kept climbing for a
+    # moment after the last sighting
+    (f0, y0), (f1, y1) = run[-2], run[-1]
+    still_climbing = lost and y1 < y0
+    if still_climbing:
+        top = min(top, y1 - (y0 - y1) / (f1 - f0) * LOST_WHILE_CLIMBING_S * fps)
+
     return {
         "detections": len(run),
         "starts_after_s": round((run[0][0] - contact) / fps, 2),
-        "rise_shoulder_widths": round(float((head_y - min(ys)) / shoulder_width), 1),
+        "rise_shoulder_widths": round(float((head_y - top) / shoulder_width), 1),
+        "seen_rise_shoulder_widths": round(float((head_y - min(ys)) / shoulder_width), 1),
+        "still_climbing_when_lost": bool(still_climbing),
         "end_shoulder_widths": round(float((head_y - ys[-1]) / shoulder_width), 1),
     }
 
@@ -285,22 +367,72 @@ def _shuttle_incoming_speed(frames: list, contact: int, fps: float, shoulder_wid
     camera distance.
     """
     start = max(0, contact - int(round(0.3 * fps)))
-    seen = [(f["frame"], f["shuttle_x"], f["shuttle_y"]) for f in frames[start:contact + 1]
-            if f.get("shuttle_detected")]
+    seen = _plausible_detections(frames, start, contact + 1, shoulder_width, contact)
     if len(seen) < 2 or seen[-1][0] == seen[0][0] or shoulder_width <= 0:
         return None
     (f0, x0, y0), (f1, x1, y1) = seen[0], seen[-1]
     return round(float(np.hypot(x1 - x0, y1 - y0) / (f1 - f0) * fps / shoulder_width), 1)
 
 
-def describe_shot(frames: list, contact: int, side: str, track: dict) -> dict:
-    """Collects the facts about one shot around its contact frame."""
+def _racket_point(frame: dict, side: str) -> np.ndarray | None:
+    """Where the racket hand is: the racket wrist if visible, else the shoulder midpoint."""
+    keypoints = frame.get("player_keypoints", [])
+    if len(keypoints) < 33:
+        return None
+    wrist = keypoints[SIDES[side]["wrist"]]
+    if wrist.get("visibility", 0) >= MIN_VISIBILITY:
+        return np.array([wrist["px"], wrist["py"]])
+    ls, rs = keypoints[LANDMARKS["left_shoulder"]], keypoints[LANDMARKS["right_shoulder"]]
+    return np.array([(ls["px"] + rs["px"]) / 2, (ls["py"] + rs["py"]) / 2])
+
+
+def refine_contact(frames: list, peak: int, side: str, shoulder_width: float, fps: float) -> tuple:
+    """
+    The contact frame for a wrist-speed peak. If the shuttle was seen within
+    CONTACT_RADIUS_SW of the racket hand in the SHUTTLE_WINDOW_S around the
+    peak, and that sighting belongs to a moving chain of at least two
+    detections, the frame where it came closest is the contact. Otherwise the
+    peak itself is used.
+
+    Returns (contact_frame_index, distance_in_shoulder_widths or None).
+    """
+    if shoulder_width <= 0:
+        return peak, None
+    half = int(round(SHUTTLE_WINDOW_S * fps))
+    best = None
+    for j in range(max(0, peak - half), min(len(frames), peak + half + 1)):
+        frame = frames[j]
+        if not frame.get("shuttle_detected"):
+            continue
+        hand = _racket_point(frame, side)
+        if hand is None:
+            continue
+        distance = np.hypot(frame["shuttle_x"] - hand[0], frame["shuttle_y"] - hand[1]) / shoulder_width
+        if distance <= CONTACT_RADIUS_SW and (best is None or distance < best[0]):
+            best = (distance, j)
+    if best is None:
+        return peak, None
+    distance, j = best
+    chain = _plausible_detections(frames, j - half, j + half + 1, shoulder_width, j)
+    moved = max(np.hypot(x - frames[j]["shuttle_x"], y - frames[j]["shuttle_y"]) for _, x, y in chain) / shoulder_width
+    if len(chain) < 2 or moved < MIN_FLIGHT_MOVE_SW:
+        return peak, None
+    return j, round(float(distance), 1)
+
+
+def describe_shot(frames: list, peak: int, side: str, track: dict) -> dict:
+    """
+    Collects the facts about one shot. The wrist facts are measured around
+    the wrist-speed peak, where the swing is clearest; the shuttle facts are
+    measured from the contact frame, which is the peak unless the shuttle was
+    seen next to the racket (see refine_contact).
+    """
 
     fps = track["fps"]
+    shoulder_width = track["shoulder_width"]
     window = int(round(FEATURE_WINDOW_S * fps))
     prep = int(round(PREPARATION_WINDOW_S * fps))
     shuttle_window = int(round(SHUTTLE_WINDOW_S * fps))
-    frame = frames[contact]
 
     def usable_wrist(f):
         return _wrist_height(f, side) is not None
@@ -308,43 +440,46 @@ def describe_shot(frames: list, contact: int, side: str, track: dict) -> dict:
     def usable_elbow(f):
         return _elbow_angle(f, side) is not None
 
-    nearest_wrist = _nearest_frame_with(frames, contact, window, usable_wrist)
-    nearest_elbow = _nearest_frame_with(frames, contact, window, usable_elbow)
-    lead = _nearest_frame_with(frames, contact - int(round(CONTACT_HEIGHT_LEAD_S * fps)), 2, usable_wrist)
+    nearest_wrist = _nearest_frame_with(frames, peak, window, usable_wrist)
+    nearest_elbow = _nearest_frame_with(frames, peak, window, usable_elbow)
+    lead = _nearest_frame_with(frames, peak - int(round(CONTACT_HEIGHT_LEAD_S * fps)), 2, usable_wrist)
 
     # Vertical size of the swing: how far the wrist travelled up and down
     # around the peak, in shoulder widths (big for clears and lifts, small
     # for blocks, serves and net shots)
     pos = track["position"]
-    lo_sw, hi_sw = max(0, contact - int(round(0.4 * fps))), min(len(frames) - 1, contact + int(round(0.15 * fps)))
+    lo_sw, hi_sw = max(0, peak - int(round(0.4 * fps))), min(len(frames) - 1, peak + int(round(0.15 * fps)))
     swing_ys = pos[lo_sw:hi_sw + 1, 1]
     swing = round(float(np.nanmax(swing_ys) - np.nanmin(swing_ys)), 1) if np.any(~np.isnan(swing_ys)) else None
 
-    before = frames[max(0, contact - prep):contact + 1]
-    after = frames[contact:min(len(frames), contact + window + 1)]
+    before = frames[max(0, peak - prep):peak + 1]
+    after = frames[peak:min(len(frames), peak + window + 1)]
     elbows_before = [a for a in (_elbow_angle(f, side) for f in before) if a is not None]
     elbows_after = [a for a in (_elbow_angle(f, side) for f in after) if a is not None]
     knees_before = [a for a in (_knee_angle(f, side) for f in before) if a is not None]
     heights_before = [h for h in (_wrist_height(f, side) for f in before) if h is not None]
 
-    # Wrist moving up or down through the contact
-    lo, hi = max(0, contact - window // 2), min(len(frames) - 1, contact + window // 2)
+    # Wrist moving up or down through the peak
+    lo, hi = max(0, peak - window // 2), min(len(frames) - 1, peak + window // 2)
     vertical = None
     if not np.isnan(pos[lo, 1]) and not np.isnan(pos[hi, 1]) and hi > lo:
         dy = (pos[hi, 1] - pos[lo, 1]) * fps / (hi - lo)   # shoulder widths per second, + = down
         vertical = "rising" if dy < -0.5 else "falling" if dy > 0.5 else "level"
 
+    # The contact frame, and the reference heights for the shuttle facts
+    contact, shuttle_distance = refine_contact(frames, peak, side, shoulder_width, fps)
+    frame = frames[contact]
     box = frame.get("crop_box")
-
-    # Reference heights for the shuttle facts
     keypoints = frame.get("player_keypoints", [])
     head_y = keypoints[LANDMARKS["nose"]]["py"] if len(keypoints) == 33 else None
-    shoulder_width = track["shoulder_width"]
 
     return {
         "time_s": round(frame["timestamp"], 3),
         "frame": frame["frame"],
-        "peak_wrist_speed": round(float(track["speed"][contact]), 1),
+        "wrist_peak_time_s": round(frames[peak]["timestamp"], 3),
+        "contact_from_shuttle": shuttle_distance is not None,
+        "shuttle_to_wrist_shoulder_widths": shuttle_distance,
+        "peak_wrist_speed": round(float(track["speed"][peak]), 1),
         "wrist_height": _wrist_height(nearest_wrist, side) if nearest_wrist else None,
         "wrist_height_before_peak": _wrist_height(lead, side) if lead else None,
         "wrist_swing_shoulder_widths": swing,
@@ -358,8 +493,8 @@ def describe_shot(frames: list, contact: int, side: str, track: dict) -> dict:
         "wrist_side_of_body": _wrist_side_of_body(nearest_wrist, side) if nearest_wrist else None,
         "wrist_vertical_motion": vertical,
         "player_box": box,
-        "shuttle_before": _shuttle_motion(frames, contact - shuttle_window, contact),
-        "shuttle_after": _shuttle_motion(frames, contact + 1, contact + shuttle_window + 1),
+        "shuttle_before": _shuttle_motion(frames, contact - shuttle_window, contact, shoulder_width, contact),
+        "shuttle_after": _shuttle_motion(frames, contact + 1, contact + shuttle_window + 1, shoulder_width, contact),
         "shuttle_rise_after": (_shuttle_rise_after(frames, contact, fps, head_y, shoulder_width)
                                if head_y is not None else None),
         "shuttle_incoming_speed": _shuttle_incoming_speed(frames, contact, fps, shoulder_width),
@@ -416,10 +551,12 @@ def detect_shots(unified_data_path: str, racket_arm: str = "right",
 
 
 if __name__ == "__main__":
+    import argparse
 
-    UNIFIED_DATA_PATH = "outputs/unified_data.json"
+    parser = argparse.ArgumentParser(description="Find the shots in <output-dir>/unified_data.json.")
+    parser.add_argument("--racket-arm", choices=["right", "left"], default="right")
+    parser.add_argument("--output-dir", default="outputs")
+    args = parser.parse_args()
 
-    # Change to "left" if the player is left-handed
-    RACKET_ARM = "right"
-
-    detect_shots(UNIFIED_DATA_PATH, racket_arm=RACKET_ARM)
+    detect_shots(os.path.join(args.output_dir, "unified_data.json"), racket_arm=args.racket_arm,
+                 output_path=os.path.join(args.output_dir, "shot_events.json"))
