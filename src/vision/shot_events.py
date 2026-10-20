@@ -88,6 +88,13 @@ MIN_FLIGHT_MOVE_SW = 0.5
 # stop when the detector loses sight of it
 LOST_WHILE_CLIMBING_S = 0.1
 
+# The shuttle's speed just before and just after contact is measured over
+# this long, and needs at least this many sightings: two sightings can be
+# one real shuttle and one false detection, which once made a serve look
+# like a block
+SPEED_WINDOW_S = 0.3
+MIN_SPEED_DETECTIONS = 3
+
 
 # ============================================================
 # WRIST TRACK
@@ -360,18 +367,31 @@ def _shuttle_rise_after(frames: list, contact: int, fps: float, head_y: float,
     }
 
 
-def _shuttle_incoming_speed(frames: list, contact: int, fps: float, shoulder_width: float) -> float | None:
+def _shuttle_speed(frames: list, start: int, stop: int, anchor: int, fps: float,
+                   shoulder_width: float) -> float | None:
     """
-    Speed of the shuttle in the 0.3 s before contact, in shoulder widths per
-    second — so the number means the same thing at any video resolution or
-    camera distance.
+    The shuttle's average speed across the detections in [start, stop), in
+    shoulder widths per second — so the number means the same thing at any
+    video resolution or camera distance. None with fewer than
+    MIN_SPEED_DETECTIONS sightings.
     """
-    start = max(0, contact - int(round(0.3 * fps)))
-    seen = _plausible_detections(frames, start, contact + 1, shoulder_width, contact)
-    if len(seen) < 2 or seen[-1][0] == seen[0][0] or shoulder_width <= 0:
+    seen = _plausible_detections(frames, start, stop, shoulder_width, anchor)
+    if len(seen) < MIN_SPEED_DETECTIONS or seen[-1][0] == seen[0][0] or shoulder_width <= 0:
         return None
     (f0, x0, y0), (f1, x1, y1) = seen[0], seen[-1]
     return round(float(np.hypot(x1 - x0, y1 - y0) / (f1 - f0) * fps / shoulder_width), 1)
+
+
+def _shuttle_incoming_speed(frames: list, contact: int, fps: float, shoulder_width: float) -> float | None:
+    """How fast the shuttle was arriving in the SPEED_WINDOW_S before contact."""
+    start = max(0, contact - int(round(SPEED_WINDOW_S * fps)))
+    return _shuttle_speed(frames, start, contact + 1, contact, fps, shoulder_width)
+
+
+def _shuttle_outgoing_speed(frames: list, contact: int, fps: float, shoulder_width: float) -> float | None:
+    """How fast the shuttle left in the SPEED_WINDOW_S after contact (a smash leaves fast, a drop slowly)."""
+    stop = contact + int(round(SPEED_WINDOW_S * fps)) + 1
+    return _shuttle_speed(frames, contact, stop, contact, fps, shoulder_width)
 
 
 def _racket_point(frame: dict, side: str) -> np.ndarray | None:
@@ -498,6 +518,7 @@ def describe_shot(frames: list, peak: int, side: str, track: dict) -> dict:
         "shuttle_rise_after": (_shuttle_rise_after(frames, contact, fps, head_y, shoulder_width)
                                if head_y is not None else None),
         "shuttle_incoming_speed": _shuttle_incoming_speed(frames, contact, fps, shoulder_width),
+        "shuttle_outgoing_speed": _shuttle_outgoing_speed(frames, contact, fps, shoulder_width),
     }
 
 

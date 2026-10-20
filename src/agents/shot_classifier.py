@@ -3,9 +3,10 @@ Names each detected shot (smash, clear, drop, ...).
 
 The main method is a set of rules on the measured facts from shot_events.py:
 where the racket wrist was at contact (overhead or below the shoulder), how
-high the shuttle climbed afterwards (a clear or lift goes high and deep, a
-drop or net shot stays low), how fast the shuttle was coming in (a block
-returns a fast shot), and whether the shot followed a long pause (a serve).
+fast the shuttle left (a smash leaves fast), how high the shuttle climbed
+afterwards (a clear or lift goes high and deep, a drop or net shot stays
+low), how fast the shuttle was coming in (a block returns a fast shot), and
+whether the shot followed a long pause (a serve).
 
 Claude can optionally be asked instead (--use-claude), given the same facts
 plus video frames. In testing on amateur phone footage this was LESS
@@ -136,6 +137,8 @@ def describe_features(event: dict, racket_arm: str) -> str:
 
     add("racket wrist moving", event.get("wrist_vertical_motion"))
     add("peak wrist speed", event.get("peak_wrist_speed"), " shoulder-widths/s (soft shots are usually under 15)")
+    add("shuttle speed just before contact", event.get("shuttle_incoming_speed"), " shoulder-widths/s")
+    add("shuttle speed just after contact", event.get("shuttle_outgoing_speed"), " shoulder-widths/s")
 
     return "\n".join(lines)
 
@@ -223,9 +226,20 @@ SHUTTLE_HIGH_RISE = 3.5
 # An incoming shuttle at least this fast (shoulder widths per second, so it
 # is the same at any resolution or camera distance) is an attacking shot
 # being returned. Returned with a short action (small wrist swing) that is a
-# block/defence; with a full swing it is a lift
-FAST_INCOMING_SPEED = 8
+# block/defence; with a full swing it is a lift. Across three labelled
+# players, blocks returned shuttles arriving at 22-23, net shots received
+# 5-9 and lifts 6-14, so the line sits in the middle of that gap
+FAST_INCOMING_SPEED = 16
 SHORT_ACTION_SWING = 1.5
+
+# An overhead hit after which the shuttle leaves at least this fast (shoulder
+# widths per second) is a smash. Based on one labelled smash (34) and one
+# labelled drop (16) so far, so smashes get low confidence until more are
+# labelled. Note this is an absolute speed, scaled only by the player's
+# size: a per-player "fast for this player" version would need several of
+# the same player's shots with the shuttle tracked, which a short clip
+# rarely has
+SMASH_OUTGOING_SPEED = 25
 
 # A shot this long after the previous one, with nothing coming in, is a serve
 SERVE_PAUSE_S = 4.0
@@ -241,8 +255,9 @@ def classify_by_rules(event: dict) -> dict:
     the Claude classifier: shot_type, stroke_side, confidence, candidates,
     reasoning. Confidence reflects how much evidence was actually available.
 
-    Tuned on one hand-labelled clip (10 shots), so expect it to need
-    adjusting as more clips are labelled.
+    Tuned on three hand-labelled players (21 shots: one amateur clip and
+    both players of a professional clip), so expect it to need adjusting as
+    more clips are labelled.
     """
 
     lead = event.get("wrist_height_before_peak")      # a quarter-second before the fastest movement
@@ -252,14 +267,19 @@ def classify_by_rules(event: dict) -> dict:
     speed = event.get("peak_wrist_speed") or 0
     rise = (event.get("shuttle_rise_after") or {}).get("rise_shoulder_widths")
     incoming = event.get("shuttle_incoming_speed")
+    outgoing = event.get("shuttle_outgoing_speed")
     pause = event.get("seconds_since_previous_shot")
 
     # Contact height. A lift's follow-through swings up to overhead after
     # contact, so "wrist overhead at the speed peak" is not enough on its
-    # own: the wrist must not have been below the shoulder just before.
+    # own: either the wrist was already up a quarter-second before, or it is
+    # overhead and coming DOWN (an overhead swing through contact). Overhead
+    # and still going up is a lift's follow-through. The "coming down" case
+    # matters for a jump smash, whose arm goes from low to overhead in little
+    # more than a tenth of a second.
     overhead = (
         lead == "overhead"
-        or (at_peak == "overhead" and lead != "below shoulder")
+        or (at_peak == "overhead" and (lead != "below shoulder" or motion == "falling"))
         or (lead == "above shoulder" and motion == "falling" and swing >= 2)
     )
 
@@ -275,6 +295,9 @@ def classify_by_rules(event: dict) -> dict:
                 "candidates": candidates, "reasoning": reasoning}
 
     if overhead:
+        if outgoing is not None and outgoing >= SMASH_OUTGOING_SPEED:
+            return answer("smash", 0.6, ["smash", "drop", "clear"],
+                          f"overhead contact; shuttle left at {outgoing} shoulder widths/s")
         if rise is not None:
             if rise >= SHUTTLE_HIGH_RISE:
                 return answer("clear", 0.75, ["clear", "smash", "drop"],
