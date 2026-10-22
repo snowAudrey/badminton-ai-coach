@@ -24,16 +24,39 @@ load_dotenv()
 client = anthropic.Anthropic()
 
 # Model to use for extraction
-# claude-haiku-3-5 is the fastest and cheapest model — ideal for batch processing
+# Haiku 4.5 is fast and cheap — ideal for batch processing
 MODEL = "claude-haiku-4-5"
 
 # How many chunks to process in test mode
-# Always test on a small batch before running all 618
+# Always test on a small batch before running all 416
 TEST_BATCH_SIZE = 5
+
+# Where the extracted facts go. The earlier, untagged extraction lives in
+# outputs/coaching_facts_full.json; this run is kept separate so the two
+# can be compared
+TEST_OUTPUT_PATH = "outputs/coaching_facts_test.json"
+FULL_OUTPUT_PATH = "outputs/coaching_facts_v2.json"
+
+# Fixed-choice tags. Every fact gets exactly these spellings, so the
+# knowledge base can be filtered by them — "which facts are about a lift,
+# for singles?" — instead of hoping a free-text label happens to match.
+# SHOT_TYPES matches the names the shot classifier produces, plus "net
+# kill" (a shot the tutorials teach that the classifier doesn't predict),
+# "footwork" and "general" (tactics, mindset, grip, anything else)
+SHOT_TYPES = ["smash", "clear", "drop", "drive", "net shot", "lift", "block/defence",
+              "serve", "return of serve", "net kill", "footwork", "general"]
+STROKE_SIDES = ["forehand", "backhand", "any"]
+DISCIPLINES = ["singles", "doubles", "both"]
+BODY_PARTS = ["grip", "wrist", "elbow", "shoulder", "arm", "torso", "hips", "legs", "feet", "head"]
 
 # Small delay between API calls in seconds
 # Prevents hitting rate limits on large batches
 API_DELAY_SECONDS = 0.5
+
+# Longest reply allowed, in tokens. A 500-word chunk can hold a dozen
+# facts, each with several sentences; 2000 cut one chunk's reply off in the
+# middle of a fact, which made the whole reply unreadable
+MAX_REPLY_TOKENS = 4000
 
 
 # ============================================================
@@ -48,7 +71,11 @@ Given this transcript chunk from a badminton tutorial video, extract every concr
 Extract one JSON object per distinct coaching point — do not bundle multiple aspects of a technique into one object.
 
 For each coaching fact, output a JSON object with these fields:
-- "technique": the stroke or skill being discussed (e.g. "drop shot", "clear", "corner footwork") 
+- "technique": the stroke or skill being discussed, in a few words (e.g. "drop shot", "clear", "corner footwork")
+- "shot_types": a list of one to three entries chosen from exactly this list: "smash", "clear", "drop", "drive", "net shot", "lift", "block/defence", "serve", "return of serve", "net kill", "footwork", "general". Name the shot(s) the advice is about. Use "footwork" for movement advice not tied to one shot, and "general" for tactics, mindset, grip changes or anything else. Copy the spelling exactly.
+- "stroke_side": "forehand", "backhand", or "any" when the advice applies to both sides or the side is not mentioned
+- "discipline": "doubles" if the advice depends on having a partner (doubles rotation, formation, "your partner"), "singles" if it depends on covering the whole court alone, otherwise "both"
+- "body_parts": a list of zero to three entries chosen from exactly this list: "grip", "wrist", "elbow", "shoulder", "arm", "torso", "hips", "legs", "feet", "head". Name the body parts the advice is about.
 - "preparation": the body position, stance, grip, or setup required before executing the shot — leave empty string "" if not mentioned
 - "execution": the swing, contact point, follow-through, or movement during the shot — leave empty string "" if not mentioned
 - "common_mistake": the specific error and what it causes (e.g. "dropping the elbow causes the racket face to open and the shuttle to land short") — leave empty string "" if not mentioned
@@ -63,6 +90,7 @@ Rules:
 - Each fact must make sense as standalone advice without needing the video
 - Keep cue language close to the transcript — do not invent coaching advice not present in the text
 - If no coaching facts are present in the chunk, return an empty array []
+- Tag values must come from the lists above, spelled exactly as given
 
 Return ONLY a valid JSON array. No explanation, no markdown, no preamble.
 
@@ -70,6 +98,10 @@ Example output format:
 [
   {
     "technique": "drop shot",
+    "shot_types": ["drop"],
+    "stroke_side": "forehand",
+    "discipline": "both",
+    "body_parts": ["torso", "legs"],
     "preparation": "Turn your whole body so you're facing sideways, feet wider than shoulder-width, most of your weight on the back leg.",
     "execution": "",
     "common_mistake": "",
@@ -77,25 +109,71 @@ Example output format:
     "context": "Forehand side, setting up body position before playing the drop shot."
   },
   {
-    "technique": "drop shot",
+    "technique": "overhead preparation",
+    "shot_types": ["drop", "clear", "smash"],
+    "stroke_side": "forehand",
+    "discipline": "both",
+    "body_parts": ["grip", "shoulder", "elbow"],
     "preparation": "Use a forehand grip with racket arm shoulder and elbow at 90 degrees.",
     "execution": "",
     "common_mistake": "Racket arm too straight or too bent reduces power and control.",
     "cue": "Have your racket arm shoulder and elbow at 90 degrees before swinging.",
-    "context": "Racket arm setup for drop shot."
+    "context": "Racket arm setup for any overhead shot."
   },
   {
-    "technique": "drop shot",
+    "technique": "doubles rotation",
+    "shot_types": ["general"],
+    "stroke_side": "any",
+    "discipline": "doubles",
+    "body_parts": [],
     "preparation": "",
-    "execution": "Raise non-racket arm up almost pointing to the shuttle. Strike the shuttle just in front of your body and rotate hips through contact.",
-    "common_mistake": "Not rotating hips and using only the arm creates awkward movement and loss of control.",
-    "cue": "Have your non-racket arm up pointing to the shuttle and rotate your hips through the shot.",
-    "context": "Execution phase of the drop shot."
+    "execution": "",
+    "common_mistake": "Both players standing side by side when attacking leaves the front of the court open.",
+    "cue": "When your partner smashes, move forward to cover the net.",
+    "context": "Attacking in doubles after a lift from the opponents."
   }
 ]
 
 Transcript chunk:
 {chunk_text}"""
+
+
+# ============================================================
+# TAG CLEANING
+# ============================================================
+
+def _pick(values, allowed: list, limit: int) -> list:
+    """Keeps the entries of `values` that are in `allowed` (case-insensitive), at most `limit`."""
+    if isinstance(values, str):
+        values = [values]
+    kept = []
+    for value in values or []:
+        value = str(value).strip().lower()
+        if value in allowed and value not in kept:
+            kept.append(value)
+    return kept[:limit]
+
+
+def clean_tags(fact: dict) -> dict:
+    """
+    Forces every tag onto the fixed lists. Anything Claude spelled its own
+    way is dropped, and an empty shot list becomes "general", so a later
+    filter never meets a value it doesn't know.
+    """
+    fact["shot_types"] = _pick(fact.get("shot_types"), SHOT_TYPES, 3) or ["general"]
+    fact["stroke_side"] = (_pick(fact.get("stroke_side"), STROKE_SIDES, 1) or ["any"])[0]
+    fact["discipline"] = (_pick(fact.get("discipline"), DISCIPLINES, 1) or ["both"])[0]
+    fact["body_parts"] = _pick(fact.get("body_parts"), BODY_PARTS, 3)
+    for field in ("technique", "preparation", "execution", "common_mistake", "cue", "context"):
+        fact[field] = str(fact.get(field) or "").strip()
+    return fact
+
+
+def _fact_key(fact: dict) -> tuple:
+    """What makes two facts the same tip: the same cue, execution and mistake text."""
+    def norm(text):
+        return " ".join(str(text or "").lower().split())
+    return norm(fact.get("cue")), norm(fact.get("execution")), norm(fact.get("common_mistake"))
 
 
 # ============================================================
@@ -125,7 +203,7 @@ def extract_from_chunk(chunk: dict) -> list:
         # Call the Claude API
         response = client.messages.create(
             model=MODEL,
-            max_tokens=2000,
+            max_tokens=MAX_REPLY_TOKENS,
             messages=[
                 {"role": "user", "content": prompt}
             ]
@@ -143,12 +221,19 @@ def extract_from_chunk(chunk: dict) -> list:
         # Parse the JSON response
         facts = json.loads(raw_response)
 
-        # Add source metadata to each fact so we know which video it came from
+        # Clean the tags and add source metadata so we know which video each fact came from
+        cleaned = []
         for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            fact = clean_tags(fact)
             fact["source"] = chunk["source"]
+            fact["video_title"] = chunk.get("video_title", "")
+            fact["level"] = chunk.get("level", "")
             fact["chunk_index"] = chunk["chunk_index"]
+            cleaned.append(fact)
 
-        return facts
+        return cleaned
 
     except json.JSONDecodeError:
         # Claude returned something that wasn't valid JSON
@@ -181,6 +266,8 @@ def extract_batch(chunks: list, output_json_path: str) -> list:
     """
 
     all_facts = []
+    seen_keys = set()
+    repeats = 0
     total = len(chunks)
 
     print(f"Starting extraction on {total} chunks...")
@@ -191,9 +278,16 @@ def extract_batch(chunks: list, output_json_path: str) -> list:
         if i % 10 == 0:
             print(f"  Processing chunk {i + 1} / {total} — {len(all_facts)} facts extracted so far")
 
-        # Extract coaching facts from this chunk
-        facts = extract_from_chunk(chunk)
-        all_facts.extend(facts)
+        # Extract coaching facts from this chunk, skipping a tip already
+        # recorded word for word (chunks overlap by 50 words, so the same
+        # sentence can be extracted twice)
+        for fact in extract_from_chunk(chunk):
+            key = _fact_key(fact)
+            if key in seen_keys:
+                repeats += 1
+                continue
+            seen_keys.add(key)
+            all_facts.append(fact)
 
         # Small delay between calls to avoid rate limits
         time.sleep(API_DELAY_SECONDS)
@@ -207,7 +301,7 @@ def extract_batch(chunks: list, output_json_path: str) -> list:
 
     print(f"\nExtraction complete!")
     print(f"  Chunks processed: {total}")
-    print(f"  Facts extracted:  {len(all_facts)}")
+    print(f"  Facts extracted:  {len(all_facts)} ({repeats} word-for-word repeats dropped)")
     print(f"  Saved → {output_json_path}")
 
     return all_facts
@@ -234,19 +328,21 @@ def run_test_extraction(transcripts_dir: str = "data/transcripts"):
     # Run extraction on the small test batch
     facts = extract_batch(
         chunks=test_chunks,
-        output_json_path="outputs/coaching_facts_test.json"
+        output_json_path=TEST_OUTPUT_PATH
     )
 
     # Print the extracted facts so you can evaluate quality
     print(f"\nExtracted facts from test batch:")
     for fact in facts:
         print(f"\n  Technique: {fact.get('technique', '?')}")
+        print(f"  Tags: shots {fact.get('shot_types')} | side {fact.get('stroke_side')} | "
+              f"{fact.get('discipline')} | body {fact.get('body_parts')} | level {fact.get('level')}")
         print(f"  Preparation: {fact.get('preparation', '?')}")
         print(f"  Execution: {fact.get('execution', '?')}")
         print(f"  Common mistake: {fact.get('common_mistake', '?')}")
         print(f"  Cue: {fact.get('cue', '?')}")
         print(f"  Context: {fact.get('context', '?')}")
-        print(f"  Source: {fact.get('source', '?')}")
+        print(f"  Source: {fact.get('video_title', '?')}")
 
     return facts
 
@@ -254,7 +350,7 @@ def run_test_extraction(transcripts_dir: str = "data/transcripts"):
 def run_full_extraction(transcripts_dir: str = "data/transcripts"):
     """
     Runs extraction on ALL chunks. Only call this after verifying test results look good.
-    This will make ~618 API calls — takes several minutes and costs ~$1.50-2.00.
+    This will make ~416 API calls — takes several minutes and costs well under a dollar.
     """
 
     print("=== FULL EXTRACTION MODE ===\n")
@@ -271,22 +367,59 @@ def run_full_extraction(transcripts_dir: str = "data/transcripts"):
     # Run extraction on everything
     facts = extract_batch(
         chunks=all_chunks,
-        output_json_path="outputs/coaching_facts_full.json"
+        output_json_path=FULL_OUTPUT_PATH
     )
 
     return facts
 
 
+def redo_videos(title_text: str, transcripts_dir: str = "data/transcripts",
+                facts_json_path: str = FULL_OUTPUT_PATH) -> list:
+    """
+    Re-extracts only the videos whose title contains title_text and swaps
+    their facts into the saved facts file, so one failed chunk doesn't need
+    the whole run again.
+    """
+
+    wanted = [c for c in parse_all_vtt_files(transcripts_dir) if title_text.lower() in c["video_title"].lower()]
+    if not wanted:
+        print(f"No video title contains {title_text!r}")
+        return []
+    titles = sorted({c["video_title"] for c in wanted})
+    print(f"Re-extracting {len(wanted)} chunk(s) from: {titles}")
+
+    with open(facts_json_path) as f:
+        facts = json.load(f)
+    kept = [fact for fact in facts if fact.get("video_title") not in titles]
+    redone = extract_batch(wanted, output_json_path=TEST_OUTPUT_PATH)
+
+    with open(facts_json_path, "w") as f:
+        json.dump(kept + redone, f, indent=2)
+    print(f"Replaced {len(facts) - len(kept)} fact(s) with {len(redone)} → {facts_json_path} now holds {len(kept) + len(redone)} facts")
+    return redone
+
+
 # ============================================================
 # This block only runs when you execute this file directly.
+#   python -m src.knowledge.knowledge_extractor --test             first few chunks → outputs/coaching_facts_test.json
+#   python -m src.knowledge.knowledge_extractor --full             every chunk      → outputs/coaching_facts_v2.json
+#   python -m src.knowledge.knowledge_extractor --video "Serve"    redo the videos whose title contains "Serve"
 # ============================================================
 
 if __name__ == "__main__":
+    import argparse
 
-    # STEP 1: Always run the test first
-    # Check outputs/coaching_facts_test.json and the printed facts
-    # before proceeding to full extraction
-    # test_facts = run_test_extraction()
+    parser = argparse.ArgumentParser(description="Extract tagged coaching facts from the tutorial transcripts.")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--test", action="store_true", help=f"process the first {TEST_BATCH_SIZE} chunks only")
+    mode.add_argument("--full", action="store_true", help="process every chunk (run --test first)")
+    mode.add_argument("--video", metavar="TITLE_TEXT",
+                      help="re-extract only the videos whose title contains this text, and update the saved facts")
+    args = parser.parse_args()
 
-    # STEP 2: Only uncomment this after you're happy with the test results
-    full_facts = run_full_extraction()
+    if args.test:
+        run_test_extraction()
+    elif args.full:
+        run_full_extraction()
+    else:
+        redo_videos(args.video)

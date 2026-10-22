@@ -23,7 +23,7 @@ The project has two pipelines: a computer vision pipeline that turns video into 
 - `orchestrator.py` — sends the pose observations and retrieved coaching facts to Claude again, which synthesizes grounded, timestamped feedback — naming multiple plausible shot types when the retrieved facts don't clearly point to one, rather than guessing confidently.
 
 **3. Offline knowledge base build** (`src/knowledge/`, run once — not part of the per-video pipeline)
-- `caption_parser.py` + `knowledge_extractor.py` — parses caption transcripts from 165 badminton tutorial videos and runs them through a Claude extraction pipeline to pull out ~2,900 structured coaching facts (technique, preparation, execution, common mistake, cue, context).
+- `caption_parser.py` + `knowledge_extractor.py` — parses caption transcripts from 117 badminton tutorial videos (48 duplicate copies are skipped) and runs them through a Claude extraction pipeline to pull out ~2,100 structured coaching facts (technique, preparation, execution, common mistake, cue, context), each tagged with fixed-choice labels: shot type (the same names the shot classifier uses), forehand/backhand, singles/doubles, body parts, and the video's audience level.
 - `vector_store.py` — embeds and stores those facts in ChromaDB for semantic retrieval.
 
 ## Tech stack

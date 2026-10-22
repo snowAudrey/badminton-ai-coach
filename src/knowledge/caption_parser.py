@@ -16,6 +16,23 @@ CHUNK_SIZE_WORDS = 500
 # Overlap prevents coaching cues from being cut in half at chunk boundaries
 CHUNK_OVERLAP_WORDS = 50
 
+# The transcript folders are named by the audience of the videos in them.
+# A video that sits in more than one folder is for everyone.
+LEVEL_BY_FOLDER = {
+    "Beginner_Tutorials": "beginner",
+    "Intermediate_and_Advanced_Tutorials": "intermediate/advanced",
+}
+LEVEL_FOR_ALL = "all levels"
+
+
+def video_title(vtt_path: str) -> str:
+    """'4 Ways To Master Your Backhand In Badminton.en.vtt' -> '4 Ways To Master Your Backhand In Badminton'."""
+    name = os.path.basename(vtt_path)
+    for suffix in (".en.vtt", ".vtt"):
+        if name.endswith(suffix):
+            return name[:-len(suffix)]
+    return name
+
 
 def parse_vtt(vtt_path: str) -> str:
     """
@@ -70,13 +87,15 @@ def parse_vtt(vtt_path: str) -> str:
     return full_text.strip()
 
 
-def chunk_text(text: str, source_file: str) -> list:
+def chunk_text(text: str, source_file: str, level: str = "") -> list:
     """
     Splits a long text string into overlapping chunks of ~CHUNK_SIZE_WORDS words.
 
     Each chunk is returned as a dict with:
     - "text": the chunk content
     - "source": the filename this came from (useful for debugging retrieval later)
+    - "video_title": the filename without its .en.vtt ending
+    - "level": who the video is for (see LEVEL_BY_FOLDER)
     - "chunk_index": which chunk this is within the source file
 
     Overlap is included so that coaching cues that fall near a chunk boundary
@@ -107,6 +126,8 @@ def chunk_text(text: str, source_file: str) -> list:
         chunks.append({
             "text": chunk_text_str,
             "source": os.path.basename(source_file),
+            "video_title": video_title(source_file),
+            "level": level,
             "chunk_index": chunk_index
         })
 
@@ -122,11 +143,42 @@ def chunk_text(text: str, source_file: str) -> list:
     return chunks
 
 
+def find_videos(transcripts_dir: str) -> list:
+    """
+    Lists each video once, as (vtt_path, level), even when the same file
+    sits in more than one folder. 48 of the 165 transcript files are exact
+    copies of a video that is in both the beginner and the
+    intermediate/advanced folder; those videos count once, as "all levels".
+    """
+
+    # Find all .vtt files anywhere under transcripts_dir
+    # ** means "any subfolder", recursive=True enables it
+    pattern = os.path.join(transcripts_dir, "**", "*.vtt")
+    vtt_files = sorted(glob(pattern, recursive=True))
+
+    folders_by_name = {}
+    path_by_name = {}
+    for vtt_path in vtt_files:
+        name = os.path.basename(vtt_path)
+        folder = os.path.basename(os.path.dirname(vtt_path))
+        folders_by_name.setdefault(name, []).append(folder)
+        path_by_name.setdefault(name, vtt_path)      # keep the first copy
+
+    videos = []
+    for name, path in path_by_name.items():
+        levels = {LEVEL_BY_FOLDER.get(folder, folder) for folder in folders_by_name[name]}
+        level = LEVEL_FOR_ALL if len(levels) > 1 else levels.pop()
+        videos.append((path, level))
+
+    print(f"Found {len(vtt_files)} .vtt files → {len(videos)} distinct videos "
+          f"({len(vtt_files) - len(videos)} duplicate copies ignored)")
+    return videos
+
+
 def parse_all_vtt_files(transcripts_dir: str) -> list:
     """
-    Finds all .vtt files recursively under transcripts_dir,
-    parses each one, and returns a flat list of all text chunks
-    across all files.
+    Parses every distinct video under transcripts_dir and returns a flat list
+    of all text chunks.
 
     Args:
         transcripts_dir: Root folder to search — e.g. "data/transcripts"
@@ -134,24 +186,19 @@ def parse_all_vtt_files(transcripts_dir: str) -> list:
                          and Intermediate_and_Advanced_Tutorials/ automatically.
 
     Returns:
-        List of chunk dicts: [{"text": ..., "source": ..., "chunk_index": ...}, ...]
+        List of chunk dicts: [{"text": ..., "source": ..., "video_title": ...,
+        "level": ..., "chunk_index": ...}, ...]
     """
 
-    # Find all .vtt files anywhere under transcripts_dir
-    # ** means "any subfolder", recursive=True enables it
-    pattern = os.path.join(transcripts_dir, "**", "*.vtt")
-    vtt_files = glob(pattern, recursive=True)
-
-    if not vtt_files:
+    videos = find_videos(transcripts_dir)
+    if not videos:
         print(f"No .vtt files found under: {transcripts_dir}")
         return []
-
-    print(f"Found {len(vtt_files)} .vtt files")
 
     all_chunks = []
     skipped = 0
 
-    for vtt_path in vtt_files:
+    for vtt_path, level in videos:
 
         # Parse the file into clean text
         text = parse_vtt(vtt_path)
@@ -163,11 +210,9 @@ def parse_all_vtt_files(transcripts_dir: str) -> list:
             continue
 
         # Split into overlapping chunks
-        chunks = chunk_text(text, source_file=vtt_path)
+        all_chunks.extend(chunk_text(text, source_file=vtt_path, level=level))
 
-        all_chunks.extend(chunks)
-
-    print(f"Parsed {len(vtt_files) - skipped} files → {len(all_chunks)} chunks total")
+    print(f"Parsed {len(videos) - skipped} videos → {len(all_chunks)} chunks total")
     if skipped:
         print(f"Skipped {skipped} empty files")
 
@@ -190,5 +235,5 @@ if __name__ == "__main__":
     # Print the first 3 chunks so you can verify the output looks right
     print("\nFirst 3 chunks:")
     for chunk in chunks[:3]:
-        print(f"\n--- {chunk['source']} (chunk {chunk['chunk_index']}) ---")
+        print(f"\n--- {chunk['video_title']} [{chunk['level']}] (chunk {chunk['chunk_index']}) ---")
         print(chunk["text"][:300] + "...")  # Print first 300 chars of each chunk
