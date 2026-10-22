@@ -12,6 +12,9 @@ from dotenv import load_dotenv
 # Import the caption parser to load chunks directly from it
 from src.knowledge.caption_parser import parse_all_vtt_files
 
+# The fixed-choice tags, shared with the vector store and the agents
+from src.knowledge.tags import SHOT_TYPES, STROKE_SIDES, DISCIPLINES, BODY_PARTS
+
 
 # ============================================================
 # SETUP
@@ -37,17 +40,10 @@ TEST_BATCH_SIZE = 5
 TEST_OUTPUT_PATH = "outputs/coaching_facts_test.json"
 FULL_OUTPUT_PATH = "outputs/coaching_facts_v2.json"
 
-# Fixed-choice tags. Every fact gets exactly these spellings, so the
-# knowledge base can be filtered by them — "which facts are about a lift,
-# for singles?" — instead of hoping a free-text label happens to match.
-# SHOT_TYPES matches the names the shot classifier produces, plus "net
-# kill" (a shot the tutorials teach that the classifier doesn't predict),
-# "footwork" and "general" (tactics, mindset, grip, anything else)
-SHOT_TYPES = ["smash", "clear", "drop", "drive", "net shot", "lift", "block/defence",
-              "serve", "return of serve", "net kill", "footwork", "general"]
-STROKE_SIDES = ["forehand", "backhand", "any"]
-DISCIPLINES = ["singles", "doubles", "both"]
-BODY_PARTS = ["grip", "wrist", "elbow", "shoulder", "arm", "torso", "hips", "legs", "feet", "head"]
+# Every fact gets the fixed-choice tags from src/knowledge/tags.py, spelled
+# exactly, so the knowledge base can be filtered by them — "which facts are
+# about a lift, for singles?" — instead of hoping a free-text label happens
+# to match.
 
 # Small delay between API calls in seconds
 # Prevents hitting rate limits on large batches

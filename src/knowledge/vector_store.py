@@ -1,8 +1,11 @@
 # chromadb is the vector database — it stores text with embeddings and
 # lets us search by semantic similarity instead of exact keywords
 import chromadb
+import difflib
 import json
 import os
+
+from src.knowledge.tags import SHOT_TYPES, shot_flag
 
 
 # ============================================================
@@ -17,8 +20,19 @@ CHROMA_DB_PATH = "data/chromadb"
 # Name of the collection (like a table in a regular database)
 COLLECTION_NAME = "badminton_coaching"
 
-# Path to the extracted coaching facts from knowledge_extractor.py
-FACTS_JSON_PATH = "outputs/coaching_facts_full.json"
+# Path to the extracted, tagged coaching facts from knowledge_extractor.py
+FACTS_JSON_PATH = "outputs/coaching_facts_v2.json"
+
+# Two facts from the same video whose cues are at least this alike (0-1,
+# difflib ratio) are the coach repeating one tip; only the fuller one is kept
+NEAR_DUPLICATE_CUE_SIMILARITY = 0.85
+
+# Search results further than this from the question are dropped rather
+# than returned as the "nearest" anyway. Distances are ChromaDB's squared
+# L2 on unit embeddings: on this base a fact that answers the question
+# sits around 0.6-0.9, a loosely related one around 1.0-1.3, and an
+# unrelated one above 1.5
+MAX_DISTANCE = 1.3
 
 
 # ============================================================
@@ -85,11 +99,71 @@ def fact_to_embedding_text(fact: dict) -> str:
     return ". ".join(parts)
 
 
+def _content_size(fact: dict) -> int:
+    """How much a fact says — used to keep the fuller of two near-duplicates."""
+    return sum(len(fact.get(k) or "") for k in ("preparation", "execution", "common_mistake", "cue", "context"))
+
+
+def remove_near_duplicates(facts: list) -> list:
+    """
+    Drops facts whose cue is nearly the same as another fact's from the same
+    video (the coach says the tip twice, or two overlapping chunks both
+    produced it). The fuller fact wins.
+    """
+    by_video = {}
+    for fact in facts:
+        by_video.setdefault(fact.get("video_title", ""), []).append(fact)
+
+    kept = []
+    for group in by_video.values():
+        group = sorted(group, key=_content_size, reverse=True)
+        chosen = []
+        for fact in group:
+            cue = " ".join((fact.get("cue") or "").lower().split())
+            if cue and any(difflib.SequenceMatcher(None, cue, other).ratio() >= NEAR_DUPLICATE_CUE_SIMILARITY
+                           for other in chosen):
+                continue
+            if cue:
+                chosen.append(cue)
+            kept.append(fact)
+    # Back to a stable order: by video, then by position in the transcript
+    kept.sort(key=lambda f: (f.get("video_title", ""), f.get("chunk_index", 0)))
+    return kept
+
+
+def fact_to_metadata(fact: dict) -> dict:
+    """
+    The structured fields stored next to each fact. ChromaDB metadata values
+    must be strings, numbers or booleans, so the tag lists are stored as
+    comma-joined text, plus one yes/no field per shot type for filtering.
+    """
+    shot_types = fact.get("shot_types") or ["general"]
+    metadata = {
+        "technique": fact.get("technique", ""),
+        "preparation": fact.get("preparation", ""),
+        "execution": fact.get("execution", ""),
+        "common_mistake": fact.get("common_mistake", ""),
+        "cue": fact.get("cue", ""),
+        "context": fact.get("context", ""),
+        "shot_types": ", ".join(shot_types),
+        "stroke_side": fact.get("stroke_side", "any"),
+        "discipline": fact.get("discipline", "both"),
+        "body_parts": ", ".join(fact.get("body_parts") or []),
+        "level": fact.get("level", ""),
+        "video_title": fact.get("video_title", ""),
+        "source": fact.get("source", ""),
+        "chunk_index": fact.get("chunk_index", -1),
+    }
+    for shot in SHOT_TYPES:
+        metadata[shot_flag(shot)] = shot in shot_types
+    return metadata
+
+
 # ============================================================
 # BUILD THE KNOWLEDGE BASE (run once)
 # ============================================================
 
-def build_knowledge_base(facts_json_path: str = FACTS_JSON_PATH):
+def build_knowledge_base(facts_json_path: str = FACTS_JSON_PATH, db_path: str = CHROMA_DB_PATH):
     """
     Loads the extracted coaching facts and stores them in ChromaDB.
 
@@ -123,10 +197,16 @@ def build_knowledge_base(facts_json_path: str = FACTS_JSON_PATH):
 
     print(f"Keeping {len(useful_facts)} useful facts ({skipped} skipped as empty)")
 
+    # ----- Step 2b: Drop near-duplicates -----
+
+    before = len(useful_facts)
+    useful_facts = remove_near_duplicates(useful_facts)
+    print(f"Dropped {before - len(useful_facts)} near-duplicate facts (same tip twice in one video)")
+
     # ----- Step 3: Connect to ChromaDB -----
 
-    # PersistentClient saves the database to disk at CHROMA_DB_PATH
-    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    # PersistentClient saves the database to disk at db_path
+    client = chromadb.PersistentClient(path=db_path)
 
     # Delete the collection if it already exists — this makes the build
     # repeatable: re-running always gives a fresh, consistent database
@@ -158,18 +238,8 @@ def build_knowledge_base(facts_json_path: str = FACTS_JSON_PATH):
         # The concatenated text used for semantic matching
         documents.append(fact_to_embedding_text(fact))
 
-        # The structured fields, preserved individually
-        # ChromaDB metadata values must be strings/numbers/bools — no None
-        metadatas.append({
-            "technique": fact.get("technique", ""),
-            "preparation": fact.get("preparation", ""),
-            "execution": fact.get("execution", ""),
-            "common_mistake": fact.get("common_mistake", ""),
-            "cue": fact.get("cue", ""),
-            "context": fact.get("context", ""),
-            "source": fact.get("source", ""),
-            "chunk_index": fact.get("chunk_index", -1)
-        })
+        # The structured fields and tags, preserved individually
+        metadatas.append(fact_to_metadata(fact))
 
     # ----- Step 5: Insert in batches -----
 
@@ -191,7 +261,7 @@ def build_knowledge_base(facts_json_path: str = FACTS_JSON_PATH):
     print(f"\nKnowledge base built!")
     print(f"  Collection: '{COLLECTION_NAME}'")
     print(f"  Total facts stored: {collection.count()}")
-    print(f"  Saved to: {CHROMA_DB_PATH}")
+    print(f"  Saved to: {db_path}")
 
     return collection
 
@@ -200,46 +270,77 @@ def build_knowledge_base(facts_json_path: str = FACTS_JSON_PATH):
 # QUERY THE KNOWLEDGE BASE (used by the Knowledge Agent)
 # ============================================================
 
-def query_knowledge_base(question: str, n_results: int = 6) -> list:
+def _filter(shot_type: str = None, discipline: str = None) -> dict | None:
+    """
+    The ChromaDB "where" clause for the tags. A shot type keeps only facts
+    tagged with it. A discipline of "singles" keeps facts for singles or
+    both (never doubles-only advice); "doubles" keeps doubles or both.
+    """
+    conditions = []
+    if shot_type:
+        if shot_type not in SHOT_TYPES:
+            raise ValueError(f"Unknown shot type {shot_type!r}; choose from {SHOT_TYPES}")
+        conditions.append({shot_flag(shot_type): True})
+    if discipline in ("singles", "doubles"):
+        conditions.append({"discipline": {"$in": [discipline, "both"]}})
+    if not conditions:
+        return None
+    return conditions[0] if len(conditions) == 1 else {"$and": conditions}
+
+
+def query_knowledge_base(question: str, n_results: int = 6, shot_type: str = None,
+                         discipline: str = None, max_distance: float = MAX_DISTANCE,
+                         db_path: str = CHROMA_DB_PATH) -> list:
     """
     Searches the knowledge base for facts relevant to a question.
 
-    This is the function the Knowledge Agent will call.
+    This is the function the Knowledge Agent calls.
 
     Args:
-        question:  Natural language query, e.g. "correct elbow position
-                   for backhand clear" or "why does my serve go too high"
-        n_results: How many facts to return (default 5)
+        question:     Natural language query, e.g. "elbow position when
+                      hitting a lift from below the shoulder"
+        n_results:    How many facts to return at most
+        shot_type:    Only facts tagged with this shot (one of SHOT_TYPES), if given
+        discipline:   "singles" or "doubles" — leaves out advice that only
+                      applies to the other discipline
+        max_distance: Facts further than this from the question are dropped
+                      (None = keep all)
 
     Returns:
         List of fact dicts, most relevant first. Each dict has the
-        structured fields plus a "relevance_distance" score
-        (lower = more relevant).
+        structured fields and tags, an "id", and a "relevance_distance"
+        score (lower = more relevant).
     """
 
     # Connect to the existing database on disk
-    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    client = chromadb.PersistentClient(path=db_path)
 
     # Get the collection — raises an error if build_knowledge_base()
     # hasn't been run yet
     collection = client.get_collection(name=COLLECTION_NAME)
 
-    # Run the semantic search
-    # ChromaDB embeds the question and finds the closest stored facts
+    # Run the semantic search: ChromaDB embeds the question and finds the
+    # closest stored facts among those that pass the tag filter
+    where = _filter(shot_type, discipline)
     results = collection.query(
         query_texts=[question],
-        n_results=n_results
+        n_results=n_results,
+        **({"where": where} if where else {}),
     )
 
     # ChromaDB returns parallel lists nested one level deep
     # (because we can query multiple questions at once — we only sent one)
+    ids = results["ids"][0]
     metadatas = results["metadatas"][0]
     distances = results["distances"][0]
 
-    # Repackage into a clean list of fact dicts
+    # Repackage into a clean list of fact dicts, dropping weak matches
     facts = []
-    for metadata, distance in zip(metadatas, distances):
-        fact = dict(metadata)
+    for fact_id, metadata, distance in zip(ids, metadatas, distances):
+        if max_distance is not None and distance > max_distance:
+            continue
+        fact = {k: v for k, v in metadata.items() if not k.startswith("shot_") or k == "shot_types"}
+        fact["id"] = fact_id
         fact["relevance_distance"] = round(distance, 4)
         facts.append(fact)
 
@@ -256,25 +357,26 @@ if __name__ == "__main__":
     # Only needs to run once — comment it out after the first successful build
     build_knowledge_base()
 
-    # STEP 2: Test retrieval with a few queries
+    # STEP 2: Test retrieval with a few queries, with and without tag filters
     # Check that the returned facts are actually relevant to each question
     test_queries = [
-        "correct grip for backhand serve",
-        "why does my serve go too high over the net",
-        "footwork to the forehand front corner",
-        "elbow position on clear shots"
+        ("correct grip for backhand serve", "serve", None),
+        ("wrist position hitting a lift from below the shoulder", "lift", "singles"),
+        ("elbow straight at contact on an overhead clear", "clear", None),
+        ("footwork to the forehand front corner", "footwork", None),
+        ("what to do after a straight smash", "smash", "singles"),
     ]
 
-    for query in test_queries:
+    for query, shot, discipline in test_queries:
         print(f"\n{'=' * 60}")
-        print(f"QUERY: {query}")
+        print(f"QUERY: {query}   [shot: {shot or 'any'}, discipline: {discipline or 'any'}]")
         print('=' * 60)
 
-        facts = query_knowledge_base(query, n_results=3)
+        facts = query_knowledge_base(query, n_results=3, shot_type=shot, discipline=discipline)
 
         for i, fact in enumerate(facts):
             print(f"\n  Result {i + 1} (distance: {fact['relevance_distance']})")
-            print(f"  Technique: {fact['technique']}")
+            print(f"  Technique: {fact['technique']}  [{fact['shot_types']} | {fact['stroke_side']} | {fact['discipline']}]")
             if fact["preparation"]:
                 print(f"  Preparation: {fact['preparation']}")
             if fact["execution"]:
@@ -283,4 +385,4 @@ if __name__ == "__main__":
                 print(f"  Common mistake: {fact['common_mistake']}")
             if fact["cue"]:
                 print(f"  Cue: {fact['cue']}")
-            print(f"  Source: {fact['source']}")
+            print(f"  Source: {fact['video_title']}")

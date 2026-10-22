@@ -249,11 +249,15 @@ def retrieve_knowledge_for_segment(observations: list) -> dict:
     # Step 1: generate search queries from the pose patterns in this window
     queries = translate_observations_to_queries(observations)
 
-    # Step 2: retrieve coaching facts for each query
+    # Step 2: retrieve coaching facts for each query. A fact that already
+    # came back for an earlier query is not repeated
     results = {}
+    seen_ids = set()
 
     for query in queries:
-        facts = query_knowledge_base(query, n_results=N_RESULTS_PER_QUERY)
+        facts = [fact for fact in query_knowledge_base(query, n_results=N_RESULTS_PER_QUERY)
+                 if fact.get("id") not in seen_ids]
+        seen_ids.update(fact.get("id") for fact in facts)
         results[query] = facts
 
         # Small delay between API-backed calls to avoid rate limits

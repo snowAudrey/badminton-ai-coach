@@ -24,7 +24,7 @@ The project has two pipelines: a computer vision pipeline that turns video into 
 
 **3. Offline knowledge base build** (`src/knowledge/`, run once — not part of the per-video pipeline)
 - `caption_parser.py` + `knowledge_extractor.py` — parses caption transcripts from 117 badminton tutorial videos (48 duplicate copies are skipped) and runs them through a Claude extraction pipeline to pull out ~2,100 structured coaching facts (technique, preparation, execution, common mistake, cue, context), each tagged with fixed-choice labels: shot type (the same names the shot classifier uses), forehand/backhand, singles/doubles, body parts, and the video's audience level.
-- `vector_store.py` — embeds and stores those facts in ChromaDB for semantic retrieval.
+- `vector_store.py` — removes near-duplicate facts, then embeds and stores the rest in ChromaDB with their tags. A search can be limited to one shot type and to singles or doubles, and matches too far from the question are dropped instead of being returned as the "nearest" anyway.
 
 ## Tech stack
 
