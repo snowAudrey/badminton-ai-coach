@@ -312,8 +312,15 @@ def classify_by_rules(event: dict) -> dict:
 
     # Hit from below the shoulder from here on
     if (pause is None or pause >= SERVE_PAUSE_S) and incoming is None:
-        return answer("serve", 0.6, ["serve", "lift", "net shot"],
-                      "below-shoulder contact after a long pause with no shuttle coming in")
+        # A high serve climbs like a lift; a low serve stays low. Without the
+        # shuttle's flight the kind of serve is unknown
+        height = "high" if rise is not None and rise >= SHUTTLE_HIGH_RISE else "low" if rise is not None else "unknown"
+        serve = answer("serve", 0.7, ["serve", "lift", "net shot"],
+                       "below-shoulder contact after a long pause with no shuttle coming in"
+                       + (f"; shuttle climbed {rise} shoulder widths, a {height} serve" if height != "unknown"
+                          else "; shuttle not tracked afterwards, so high or low is unknown"))
+        serve["serve_height"] = height
+        return serve
     if incoming is not None and incoming >= FAST_INCOMING_SPEED and swing < SHORT_ACTION_SWING:
         return answer("block/defence", 0.6, ["block/defence", "lift", "net shot"],
                       f"short action ({swing} shoulder widths of wrist travel) returning a fast incoming "

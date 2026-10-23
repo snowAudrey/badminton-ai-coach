@@ -1,269 +1,256 @@
-import json
-import time
-import anthropic
+"""
+Turns the shots found in a clip into searches of the coaching knowledge
+base, and collects the facts that come back, grouped by shot type.
 
-# load_dotenv reads the .env file and makes ANTHROPIC_API_KEY available to os.getenv
-from dotenv import load_dotenv
+For every shot type in the clip there is one base query (the shot's
+preparation, contact point and follow-through) plus one query for each
+measurement that stands out (elbow straight at contact, deep knee bend,
+and so on — see shot_flags). The queries are fixed templates, so the same
+clip always asks the same questions. The earlier version asked Claude to
+write queries from raw angle lines, and which shots it covered changed from
+run to run.
+
+Run on its own (after shot_events.json exists):
+    python -m src.agents.knowledge_agent --output-dir outputs
+"""
+
+import json
+import os
 
 # query_knowledge_base() searches the ChromaDB knowledge base built in vector_store.py
 from src.knowledge.vector_store import query_knowledge_base
-
-# analyze_video() turns CV pipeline output into pose observations — only needed
-# for the __main__ test block below
-from src.agents.vision_agent import analyze_video
+from src.knowledge.tags import SHOT_TYPES
 
 
 # ============================================================
-# SETUP
+# SETTINGS
 # ============================================================
 
-# Load the ANTHROPIC_API_KEY from your .env file
-load_dotenv()
+# How many coaching facts to retrieve per query (weak matches are dropped
+# by the knowledge base's distance cut-off, so a query can return fewer)
+N_RESULTS_PER_QUERY = 4
 
-# Create the Anthropic client — it automatically reads ANTHROPIC_API_KEY from environment
-client = anthropic.Anthropic()
-
-# Model to use for translating observations into search queries
-MODEL = "claude-haiku-4-5"
-
-# How many coaching facts to retrieve per generated search query
-N_RESULTS_PER_QUERY = 6
-
-# Small delay between API calls in seconds — avoids hitting rate limits
-API_DELAY_SECONDS = 0.5
-
-
-# ============================================================
-# TRANSLATION PROMPT
-# ============================================================
-# This prompt is step 1 of the bridge: it asks the LLM to look at a
-# sequence of pose observations from one time window and turn any notable
-# patterns into search queries written in coaching language.
-#
-# The LLM is NOT looking at the coaching knowledge base here — it's
-# using its own general badminton knowledge to guess what techniques
-# might be involved. The actual coaching facts are retrieved afterwards
-# in retrieve_knowledge_for_segment().
-
-TRANSLATION_PROMPT = """You are reviewing pose data sampled from a short stretch (up to 30 seconds) of a badminton clip.
-
-Below is a sequence of frame-by-frame observations, ordered by time. Each line
-describes joint angles, wrist height relative to the head and shoulder, and
-shuttle detection for one sampled frame.
-
-Note on angle convention: a smaller elbow or knee angle means the joint is
-more bent (flexed); an angle closer to 180° means the joint is straighter
-(extended).
-
-Wrist height is a rough indicator of shot type: overhead usually means clear,
-smash, or drop shot; above shoulder usually means drive or net shot; below
-shoulder usually means lift or a defensive shot. When an observation suggests
-one of these height categories, generate queries covering all of that
-category's shot types (e.g. all three of clear, smash, and drop for an
-overhead pattern) rather than picking just one or two — they can look nearly
-identical in joint angles alone, and the synthesis step can only hedge
-between shots that actually have retrieved facts to draw on.
-
-Look for notable patterns across these frames — specifically, points in time
-where a joint angle changes substantially over a short window, or the wrist
-height transitions between overhead, above shoulder, and below shoulder —
-either of which likely marks a swing or shot being played. Describe what
-changed and roughly when, without judging whether the angle or wrist height
-itself is correct or typical — you don't know what shot was being played or
-what phase of the shot this is.
-
-Based on these patterns, generate 3 to 8 search queries that could be used to
-look up relevant badminton coaching advice. Each query must name a specific
-badminton shot or technique (e.g. smash, clear, drop shot, net shot, lift,
-drive, serve) together with the body part or movement involved — not a vague
-or abstract description. For example, write "elbow extension during overhead
-clear", "knee bend when preparing for a smash", or "standing position when
-preparing to return a smash" — not "dynamic knee adjustment during rally
-exchanges" or "elbow flexion recovery" with no named shot.
-
-Observations:
-{observations_text}
-
-Return ONLY a valid JSON array of query strings. No explanation, no markdown.
-
-Example output:
-["elbow extension during overhead clear", "knee bend preparation for smash", "standing position when preparing to return a smash", "wrist height during net shot"]
-"""
-
-
-# ============================================================
-# STEP 1: GROUP OBSERVATIONS BY TIME WINDOW
-# ============================================================
-
-# Longest stretch of a clip sent to Claude in one go, in seconds
+# Roughly how much of a clip is handled in one feedback call, in seconds.
+# A clip is cut into equal windows, as many as it takes to keep each one
+# near this length (a 34 s clip is one window, a 50 s clip two of 25 s)
 WINDOW_SECONDS = 30
 
+# A shot named with at least this confidence is taken as that shot. Below
+# it, the classifier's second candidate is searched as well, so the
+# feedback can hedge between the two
+CONFIDENT = 0.7
 
-def group_observations_by_window(observations: list, window_seconds: float = WINDOW_SECONDS) -> list:
+# Measurements that stand out. Angles in degrees (180 = straight joint),
+# swing in shoulder widths of racket-wrist travel
+ELBOW_STRAIGHT = 160
+ELBOW_BENT = 120
+KNEE_DEEP = 120
+KNEE_STRAIGHT = 165
+SHORT_SWING = 1.5
+BIG_SWING = 3.0
+
+# Which shots are hit from above the head, which need a full swing, and
+# which are soft touches where a big swing is a fault
+OVERHEAD_SHOTS = {"smash", "clear", "drop"}
+FULL_SWING_SHOTS = {"clear", "smash", "lift"}
+SOFT_SHOTS = {"net shot", "block/defence", "serve"}
+
+
+# ============================================================
+# STEP 1: GROUP SHOTS BY TIME WINDOW
+# ============================================================
+
+def group_events_by_window(events: list, window_seconds: float = WINDOW_SECONDS) -> list:
     """
-    Splits a flat list of observation dicts (from vision_agent.analyze_video)
-    into consecutive time windows of at most window_seconds each.
-
-    The tool is built for short clips, so a clip up to window_seconds long
-    comes back as a single "whole clip" window. Longer clips are cut purely
-    by time — no shuttle or rally detection involved.
-
-    Args:
-        observations: List of observation dicts, each with a "timestamp" key
-
-    Returns:
-        List of (label, observations) pairs in time order, e.g.
-        [("whole clip", [...])] or [("0-30s", [...]), ("30-60s", [...])]
+    Splits the clip's shots into equal consecutive windows of roughly
+    window_seconds. Returns [(label, events)], e.g. [("whole clip", [...])]
+    or [("0-25s", [...]), ("25-50s", [...])].
     """
-
-    if not observations:
+    if not events:
         return []
+    end = max(e["time_s"] for e in events)
+    count = max(1, int(round(end / window_seconds)))
+    if count == 1:
+        return [("whole clip", list(events))]
 
-    end = max(obs["timestamp"] for obs in observations)
-    if end <= window_seconds:
-        return [("whole clip", list(observations))]
-
+    length = end / count
     windows = []
-    start = 0.0
-    while start <= end:
-        stop = start + window_seconds
-        chunk = [obs for obs in observations if start <= obs["timestamp"] < stop]
+    for i in range(count):
+        start, stop = i * length, (i + 1) * length
+        chunk = [e for e in events if start <= e["time_s"] < stop or (i == count - 1 and e["time_s"] >= start)]
         if chunk:
-            windows.append((f"{int(start)}-{int(stop)}s", chunk))
-        start = stop
-
+            windows.append((f"{int(start)}-{int(round(stop))}s", chunk))
     return windows
 
 
 # ============================================================
-# STEP 2: FORMAT OBSERVATIONS FOR THE PROMPT
+# STEP 2: WHAT STANDS OUT IN A SHOT'S MEASUREMENTS
 # ============================================================
 
-def format_observations_for_prompt(observations: list) -> str:
+def shot_flags(event: dict) -> list:
     """
-    Converts a list of observation dicts into a compact, line-per-frame
-    text block that gets dropped into TRANSLATION_PROMPT.
-
-    Each line looks like:
-        t=4.3s: elbow angle is 110.8°, knee angle is 138.1°, shuttle detected this frame
-
-    Args:
-        observations: List of observation dicts for ONE time window
-
-    Returns:
-        Multi-line string, one line per observation
+    The measurements of one shot that deserve a search of their own, as
+    (query phrase, plain-language observation) pairs.
     """
+    shot = event.get("shot_type")
+    elbow = event.get("elbow_angle")
+    knee = event.get("knee_angle_min_before") if shot != "serve" else None   # a serve starts from standing
+    swing = event.get("wrist_swing_shoulder_widths")
+    highest = event.get("highest_wrist_before")      # highest the racket hand got around the swing
+    flags = []
 
-    lines = []
+    if elbow is not None:
+        if elbow >= ELBOW_STRAIGHT:
+            flags.append(("elbow straight at contact", f"elbow {elbow:.0f}° at contact, nearly straight"))
+        elif elbow <= ELBOW_BENT:
+            flags.append(("elbow very bent at contact", f"elbow {elbow:.0f}° at contact, very bent"))
 
-    for obs in observations:
-        timestamp = obs.get("timestamp", 0)
-        notes = ", ".join(obs.get("observations", []))
-        lines.append(f"t={timestamp}s: {notes}")
+    if knee is not None:
+        if knee <= KNEE_DEEP:
+            flags.append(("deep knee bend before the shot", f"deepest knee bend before the shot {knee:.0f}°, deep"))
+        elif knee >= KNEE_STRAIGHT:
+            flags.append(("legs straight, no knee bend before the shot",
+                          f"knees never below {knee:.0f}° before the shot, legs straight"))
 
-    return "\n".join(lines)
+    if shot in OVERHEAD_SHOTS and highest and highest != "overhead":
+        flags.append(("contact point below head height", f"racket hand never above the head around the swing ({highest} at best)"))
 
+    if swing is not None:
+        if shot in FULL_SWING_SHOTS and swing < SHORT_SWING:
+            flags.append(("short swing, little racket travel", f"swing only {swing} shoulder widths, short for a {shot}"))
+        elif shot in SOFT_SHOTS and swing >= BIG_SWING:
+            flags.append(("big swing on a soft shot", f"swing {swing} shoulder widths, big for a {shot}"))
 
-# ============================================================
-# STEP 3: TRANSLATE OBSERVATIONS INTO SEARCH QUERIES (LLM CALL 1)
-# ============================================================
+    # A high serve and a low serve are different techniques; ask for the right one
+    if shot == "serve" and event.get("serve_height") == "high":
+        flags.append(("high serve, height and length to the back of the court", "the serve went high"))
+    elif shot == "serve" and event.get("serve_height") == "low":
+        flags.append(("low serve, tight over the net", "the serve stayed low"))
 
-def translate_observations_to_queries(observations: list) -> list:
-    """
-    Sends one time window's worth of observations to the LLM and asks it to
-    generate search queries based on any notable patterns it sees.
-
-    Args:
-        observations: List of observation dicts for ONE time window
-
-    Returns:
-        List of search query strings (in coaching language). Empty list
-        if the LLM call fails or returns something that isn't valid JSON.
-    """
-
-    # Build the text block describing this window's observations
-    observations_text = format_observations_for_prompt(observations)
-
-    # Fill in the prompt template
-    # (using .replace() instead of .format() — same reason as in
-    # knowledge_extractor.py: the example output contains literal
-    # JSON brackets that .format() would misinterpret)
-    prompt = TRANSLATION_PROMPT.replace("{observations_text}", observations_text)
-
-    try:
-        # Call the Claude API
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=500,
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
-        )
-
-        # Extract the text response from the API result
-        raw_response = response.content[0].text.strip()
-
-        # Claude sometimes wraps its output in a markdown code fence
-        # (```json ... ```) despite being told not to — strip it if present
-        if raw_response.startswith("```"):
-            lines = raw_response.split("\n")
-            raw_response = "\n".join(lines[1:-1]).strip()
-
-        # Parse the JSON response — should be a list of strings
-        queries = json.loads(raw_response)
-
-        return queries
-
-    except json.JSONDecodeError:
-        print(f"  WARNING: JSON parse failed for translation response")
-        print(f"  Raw response: {raw_response[:200]}")
-        return []
-
-    except Exception as e:
-        print(f"  ERROR during translation: {e}")
-        return []
+    return flags
 
 
 # ============================================================
-# STEP 4: RETRIEVE COACHING FACTS FOR ONE RALLY
+# STEP 3: BUILD THE QUERIES AND RETRIEVE FACTS
 # ============================================================
 
-def retrieve_knowledge_for_segment(observations: list) -> dict:
+def base_query(shot: str) -> str:
+    return f"{shot} technique: preparation, contact point and follow-through"
+
+
+def build_queries(events: list) -> dict:
     """
-    Full pipeline for one time window:
-      1. Translate the window's observations into search queries (LLM call)
-      2. Run each query against the ChromaDB knowledge base
-      3. Return a dict mapping each query to its retrieved coaching facts
-
-    Args:
-        observations: List of observation dicts for ONE time window
-
-    Returns:
-        Dict like:
-        {
-            "elbow extension during overhead clear": [fact1, fact2, ...],
-            "knee bend preparation for smash": [fact1, fact2, ...]
-        }
+    The search queries for one window, grouped by the shot type they are
+    filtered to: {"clear": ["clear technique: ...", "clear: elbow straight at contact"], ...}
     """
+    queries = {}
 
-    # Step 1: generate search queries from the pose patterns in this window
-    queries = translate_observations_to_queries(observations)
+    def add(shot, text):
+        if shot in SHOT_TYPES and text not in queries.setdefault(shot, []):
+            queries[shot].append(text)
 
-    # Step 2: retrieve coaching facts for each query. A fact that already
-    # came back for an earlier query is not repeated
+    for event in events:
+        shot = event.get("shot_type")
+        if shot not in SHOT_TYPES:           # "other", "no shot"
+            continue
+        add(shot, base_query(shot))
+        for phrase, _ in shot_flags(event):
+            add(shot, f"{shot}: {phrase}")
+        if (event.get("confidence") or 0) < CONFIDENT:
+            for alternative in (event.get("candidates") or [])[1:2]:
+                add(alternative, base_query(alternative))
+
+    return queries
+
+
+def retrieve_facts(queries: dict, discipline: str) -> dict:
+    """
+    Runs every query against the knowledge base, limited to its shot type
+    and to the player's discipline. A fact that already came back for an
+    earlier query is not repeated. Returns {shot: {query: [facts]}}.
+    """
     results = {}
     seen_ids = set()
-
-    for query in queries:
-        facts = [fact for fact in query_knowledge_base(query, n_results=N_RESULTS_PER_QUERY)
-                 if fact.get("id") not in seen_ids]
-        seen_ids.update(fact.get("id") for fact in facts)
-        results[query] = facts
-
-        # Small delay between API-backed calls to avoid rate limits
-        time.sleep(API_DELAY_SECONDS)
-
+    for shot, texts in queries.items():
+        results[shot] = {}
+        for text in texts:
+            facts = [fact for fact in query_knowledge_base(text, n_results=N_RESULTS_PER_QUERY,
+                                                           shot_type=shot, discipline=discipline)
+                     if fact.get("id") not in seen_ids]
+            seen_ids.update(fact.get("id") for fact in facts)
+            results[shot][text] = facts
     return results
+
+
+# ============================================================
+# STEP 4: TEXT FOR THE FEEDBACK PROMPT
+# ============================================================
+
+def describe_event(event: dict) -> str:
+    """One shot as a line of plain language for the feedback prompt."""
+    shot = event.get("shot_type", "unknown")
+    confidence = event.get("confidence") or 0
+    alternatives = [c for c in (event.get("candidates") or []) if c != shot][:2]
+    name = shot
+    if shot == "serve" and event.get("serve_height") in ("high", "low"):
+        name = f"{event['serve_height']} serve"
+    head = f"At {event['time_s']:.1f}s: {name} (confidence {confidence:.2f}"
+    if alternatives:
+        head += f"; alternatives: {', '.join(alternatives)}"
+    head += ")."
+
+    parts = []
+    lead, at_peak = event.get("wrist_height_before_peak"), event.get("wrist_height")
+    if lead and at_peak:
+        parts.append(f"racket hand {lead} a quarter-second before the fastest moment and {at_peak} at it")
+    elif at_peak:
+        parts.append(f"racket hand {at_peak} at the fastest moment")
+    if event.get("elbow_angle") is not None:
+        parts.append(f"elbow {event['elbow_angle']:.0f}° at contact")
+    if event.get("elbow_angle_min_before") is not None:
+        parts.append(f"most bent the elbow got before the shot {event['elbow_angle_min_before']:.0f}°")
+    if event.get("knee_angle_min_before") is not None:
+        parts.append(f"deepest knee bend before the shot {event['knee_angle_min_before']:.0f}°")
+    if event.get("wrist_swing_shoulder_widths") is not None:
+        parts.append(f"swing {event['wrist_swing_shoulder_widths']} shoulder widths")
+    rise = (event.get("shuttle_rise_after") or {}).get("rise_shoulder_widths")
+    if rise is not None:
+        parts.append(f"shuttle climbed {rise} shoulder widths above head height afterwards")
+    elif not event.get("shuttle_after"):
+        parts.append("shuttle not tracked after contact, so where it went is unknown")
+    if event.get("shuttle_incoming_speed") is not None:
+        parts.append(f"shuttle arrived at {event['shuttle_incoming_speed']} shoulder widths/s")
+    if event.get("seconds_since_previous_shot") is not None:
+        parts.append(f"{event['seconds_since_previous_shot']} s since the previous shot")
+
+    line = head + (" Measurements: " + "; ".join(parts) + "." if parts else " No measurements.")
+    stands_out = [observation for _, observation in shot_flags(event)]
+    if stands_out:
+        line += " Stands out: " + "; ".join(stands_out) + "."
+    return line
+
+
+def format_shots_for_prompt(events: list) -> str:
+    return "\n".join(describe_event(event) for event in events)
+
+
+def format_facts_for_prompt(results: dict) -> str:
+    """The retrieved facts grouped by shot type, with every non-empty field."""
+    lines = []
+    for shot, by_query in results.items():
+        facts = [fact for query_facts in by_query.values() for fact in query_facts]
+        if not facts:
+            continue
+        lines.append(f"Facts about the {shot}:")
+        for fact in facts:
+            bits = []
+            for label, key in (("preparation", "preparation"), ("execution", "execution"),
+                               ("common mistake", "common_mistake"), ("cue", "cue")):
+                if fact.get(key):
+                    bits.append(f"{label}: {fact[key]}")
+            lines.append(f"  - ({fact.get('technique', '')}) " + " | ".join(bits))
+        lines.append("")
+    return "\n".join(lines).strip() or "No facts were retrieved."
 
 
 # ============================================================
@@ -271,36 +258,23 @@ def retrieve_knowledge_for_segment(observations: list) -> dict:
 # ============================================================
 
 if __name__ == "__main__":
+    import argparse
 
-    # Path to your unified data — same as vision_agent.py
-    UNIFIED_DATA_PATH = "outputs/unified_data.json"
+    parser = argparse.ArgumentParser(description="Show the queries and facts the feedback step would use.")
+    parser.add_argument("--output-dir", default="outputs", help="folder holding shot_events.json")
+    parser.add_argument("--discipline", choices=["singles", "doubles"], default="singles")
+    args = parser.parse_args()
 
-    # Change to "left" if the player is left-handed
-    RACKET_ARM = "right"
+    with open(os.path.join(args.output_dir, "shot_events.json")) as f:
+        events = json.load(f)
 
-    # Step 1: get pose observations from the Vision Agent
-    observations = analyze_video(UNIFIED_DATA_PATH, racket_arm=RACKET_ARM)
-
-    # Step 2: split observations into time windows
-    windows = group_observations_by_window(observations)
-    print(f"\nSplit into {len(windows)} window(s)")
-
-    # Step 3: for each window, translate observations into queries and
-    # retrieve matching coaching facts
-    for label, window_observations in windows:
-        print(f"\n{'=' * 60}")
-        print(f"{label.upper()} — {len(window_observations)} sampled frames")
-        print('=' * 60)
-
-        results = retrieve_knowledge_for_segment(window_observations)
-
-        for query, facts in results.items():
-            print(f"\nQUERY: {query}")
-
-            for i, fact in enumerate(facts):
-                print(f"\n  Result {i + 1} (distance: {fact['relevance_distance']})")
-                print(f"  Technique: {fact['technique']}")
-                if fact["cue"]:
-                    print(f"  Cue: {fact['cue']}")
-                if fact["common_mistake"]:
-                    print(f"  Common mistake: {fact['common_mistake']}")
+    for label, window_events in group_events_by_window(events):
+        print(f"\n{'=' * 60}\n{label.upper()} — {len(window_events)} shots\n{'=' * 60}")
+        print(format_shots_for_prompt(window_events))
+        queries = build_queries(window_events)
+        results = retrieve_facts(queries, args.discipline)
+        for shot, by_query in results.items():
+            for query, facts in by_query.items():
+                print(f"\nQUERY [{shot}]: {query}  → {len(facts)} fact(s)")
+                for fact in facts:
+                    print(f"   {fact['relevance_distance']}  {fact['cue'][:110]}")

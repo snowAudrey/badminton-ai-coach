@@ -19,8 +19,8 @@ The project has two pipelines: a computer vision pipeline that turns video into 
 **2. Coaching agent pipeline** (`src/agents/`)
 - `shot_classifier.py` — names each shot (smash, clear, drop, drive, net shot, lift, block/defence, serve, return of serve) with rules on those facts: contact height decides overhead vs. underarm, an overhead hit the shuttle leaves fast is a smash, the shuttle's climb separates clear/lift from drop/net shot, a fast incoming shuttle returned with a short action is a block, a long pause with nothing incoming is a serve. Claude can be asked instead (`--use-claude`, with video frames), but on phone footage the shuttle is too small to see in the frames and it guessed, so the rules are the default.
 - `vision_agent.py` — keeps MediaPipe's left/right labels consistent across frames (they can flip on footage shot from behind) and saves a check image of the arm being measured, then converts raw keypoints into human-readable pose facts per sampled frame (elbow/knee angle measured from MediaPipe's 3D landmarks, wrist height relative to head and shoulder, shuttle presence) — descriptive only, no judgment about whether an angle is "good."
-- `knowledge_agent.py` — sends the clip's pose observations (in windows of up to 30 seconds) to Claude, which spots notable angle/height-change patterns and translates them into badminton-specific search queries, then retrieves matching coaching facts from a ChromaDB knowledge base.
-- `orchestrator.py` — sends the pose observations and retrieved coaching facts to Claude again, which synthesizes grounded, timestamped feedback — naming multiple plausible shot types when the retrieved facts don't clearly point to one, rather than guessing confidently.
+- `knowledge_agent.py` — turns the named shots into knowledge-base searches: for each shot type in the clip, one query about its preparation, contact point and follow-through, plus one query for each measurement that stands out (elbow straight at contact, deep knee bend before the shot, contact below head height, a short swing on a clear, a big swing on a net shot). Searches are limited to that shot type and to the player's discipline, and no fact is returned twice.
+- `orchestrator.py` — one Claude call per clip (Sonnet) that receives the shots in time order with their measurements and the retrieved facts, and writes feedback shot by shot. A shot is named outright when the classifier's confidence is 0.7 or above, and hedged between its candidates below that. Clips much longer than 30 seconds are split into equal windows, one call each.
 
 **3. Offline knowledge base build** (`src/knowledge/`, run once — not part of the per-video pipeline)
 - `caption_parser.py` + `knowledge_extractor.py` — parses caption transcripts from 117 badminton tutorial videos (48 duplicate copies are skipped) and runs them through a Claude extraction pipeline to pull out ~2,100 structured coaching facts (technique, preparation, execution, common mistake, cue, context), each tagged with fixed-choice labels: shot type (the same names the shot classifier uses), forehand/backhand, singles/doubles, body parts, and the video's audience level.
@@ -64,20 +64,34 @@ This runs the full pipeline — player selection, pose/shuttle extraction, shot 
 Flags:
 - `--video` (required) — path to the match video
 - `--racket-arm` — `right` or `left` (default: `right`). Afterwards, open `outputs/racket_arm_check.jpg` and confirm the yellow arm is your racket arm — MediaPipe can mirror left and right on footage shot from behind
+- `--discipline` — `singles` or `doubles` (default: `singles`); keeps advice meant for the other discipline out of the feedback
 - `--output-dir` — where intermediate files are saved (default: `outputs`)
 
 ## Example output
 
 ```
-FEEDBACK FOR RALLY 1
+FEEDBACK — whole clip
 ============================================================
-Around t=2.9-3.3s: This could be a clear, smash, or drop shot. If a clear:
-you're extending your elbow nicely, but focus on accelerating through with
-your elbow coming forwards and bringing your wrist through after. If a smash:
-your arm is nearly straight at contact, which is good, but make sure you're
-throwing your elbow forwards and letting your whole forearm and wrist come
-through -- avoid only rotating the bottom half of your forearm, which
-reduces power.
+At 5.6s, lift: your racket hand rose from below the shoulder to overhead
+through the stroke and the shuttle climbed 8.8 shoulder widths above head
+height, showing you got well underneath the shuttle with your strings to
+generate height, which is exactly the aim on this shot. Nothing to flag here.
+
+At 7.6s, most likely a block/defence, possibly a lift or net shot: your elbow
+was 163° at contact, nearly straight, which matches the common mistake of
+standing with the racket too outstretched rather than keeping the elbow out
+in front of you at the correct angle. Your knee bend beforehand was deep,
+which is good, so focus on keeping that elbow in rather than fully extending it.
+
+At 27.7s, most likely a clear, possibly a smash or drop: your elbow was 166°
+at contact, nearly straight, which for a clear prevents the proper
+elbow-leading throwing action and limits power. Work on keeping the elbow
+slightly bent at contact rather than straightening it fully.
+
+Across the clip, the recurring issue was letting your arm get too straight at
+the point of contact, showing up on the block/defence at 7.6s and the clear
+at 27.7s — keep that elbow slightly bent through contact on both overhead and
+defensive shots.
 ```
 
 ## Measuring accuracy
@@ -94,7 +108,6 @@ On the first labelled clip (34 s, 10 shots): all 10 shots found within ±0.5 s w
 - Shot naming relies on the shuttle being detected during its flight; when it isn't (≈19% detection rate), overhead shots fall back to a guess between clear and drop based on swing speed, with low confidence. A smash is only recognised when the shuttle is seen leaving fast, and the speed line comes from one labelled smash and one drop so far. Forehand vs backhand is not identified yet.
 - Shot naming rules were tuned on three labelled players (21 shots) and have seen two smashes. Very soft net shots by a professional barely move the wrist and can be missed as shots altogether.
 - Shuttle detection depends on the camera's shooting angle — on footage where overhead space isn't well captured, shots hit high (e.g. clears, lifts) can go undetected entirely, independent of the model's accuracy.
-- Search query generation is non-deterministic — a plausible shot type (e.g. drop shot alongside clear and smash for an overhead pattern) can occasionally be left out of a given run's split between multiple shot types, even though the underlying prompt asks for full coverage.
 
 ## Roadmap
 

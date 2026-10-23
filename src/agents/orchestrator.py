@@ -1,5 +1,15 @@
+"""
+Writes the coaching feedback: one Claude call per clip (or per 30-second
+window of a longer clip) that receives the named shots in time order, their
+measurements, and the coaching facts retrieved for them.
+
+Run on its own (after unified_data.json and shot_events.json exist):
+    python -m src.agents.orchestrator --video data/test_clip.MOV
+"""
+
 import json
 import os
+import textwrap
 import time
 
 import anthropic
@@ -7,20 +17,16 @@ import anthropic
 # load_dotenv reads the .env file and makes ANTHROPIC_API_KEY available to os.getenv
 from dotenv import load_dotenv
 
-# analyze_video() turns CV pipeline output into pose observations
+# analyze_video() turns CV pipeline output into pose observations (kept for
+# the racket-arm check image and observations.json)
 from src.agents.vision_agent import analyze_video
 
-# group_observations_by_window() splits observations into time windows of
-#   up to 30 seconds (one Claude call per window)
-# format_observations_for_prompt() turns one window's observations into a
-#   readable text block — reused here so the synthesis prompt describes
-#   pose data the same way the translation prompt does
-# retrieve_knowledge_for_segment() runs the translation + retrieval steps
-#   (LLM call 1 + ChromaDB search) for one window
 from src.agents.knowledge_agent import (
-    group_observations_by_window,
-    format_observations_for_prompt,
-    retrieve_knowledge_for_segment
+    group_events_by_window,
+    build_queries,
+    retrieve_facts,
+    format_shots_for_prompt,
+    format_facts_for_prompt,
 )
 
 
@@ -34,179 +40,110 @@ load_dotenv()
 # Create the Anthropic client — it automatically reads ANTHROPIC_API_KEY from environment
 client = anthropic.Anthropic()
 
-# Model to use for writing the final feedback
-MODEL = "claude-haiku-4-5"
+# Model that writes the feedback. One call per clip, so the stronger model
+# is affordable. Sonnet 5 thinks before it answers, and that thinking counts
+# against the reply limit — 1,500 tokens was used up entirely by thinking
+# and no feedback text came back, so the limit is generous
+MODEL = "claude-sonnet-5"
+MAX_FEEDBACK_TOKENS = 8000
 
 # Small delay between API calls in seconds — avoids hitting rate limits
 API_DELAY_SECONDS = 0.5
 
 
 # ============================================================
-# SYNTHESIS PROMPT
+# FEEDBACK PROMPT
 # ============================================================
-# This prompt is step 2 of the bridge: it takes one window's raw pose
-# observations AND the coaching facts retrieved for that window (via
-# knowledge_agent.py) and asks the LLM to write grounded feedback.
-#
-# Unlike the translation step, this prompt is told to stay grounded in
-# the retrieved facts rather than relying on general badminton knowledge —
-# the retrieved facts are the only thing that should drive the content of
-# the feedback.
 
-SYNTHESIS_PROMPT = """You are a badminton coach reviewing a short stretch (up to 30 seconds) of a match clip.
+SYNTHESIS_PROMPT = """You are a badminton coach reviewing a short clip of one player, who plays {discipline}.
 
-Below are two things:
-1. A sequence of pose observations sampled across that stretch, with timestamps.
-2. Coaching facts retrieved from a badminton knowledge base, based on patterns
-   noticed in those observations.
+You are given:
+1. The shots the player played, in time order. Each has its detected name,
+   how sure the detection is (0 to 1), the alternatives, and a few
+   measurements taken from the video.
+2. Coaching facts retrieved from a knowledge base for those shot types and
+   those measurements. Each fact may have preparation, execution, a common
+   mistake and a cue.
 
-Note on angle convention: a smaller elbow or knee angle means the joint is
-more bent (flexed); an angle closer to 180° means the joint is straighter
-(extended).
+Write feedback for the player, shot by shot, in time order. Address the
+player as "you". For each shot, one short paragraph that starts with the
+time and the shot name, e.g. "At 5.5s, lift:", followed by 2-4 sentences.
 
-Wrist height is a rough indicator of shot type: overhead usually means clear,
-smash, or drop shot; above shoulder usually means drive or net shot; below
-shoulder usually means lift or a defensive shot.
+Rules:
+- Name the shot outright when its confidence is 0.7 or higher. Below that,
+  say what it most likely was and name the alternative ("most likely a
+  drop, possibly a clear"), then give advice that holds for both or say
+  which applies to which.
+- Use only the retrieved facts. Do not add advice from your own knowledge
+  and do not invent measurements.
+- A measurement is an observation, not proof of a mistake. Before applying
+  a common mistake, check that the measurement actually shows it; skip the
+  warning when the measurement points the other way or there is no
+  measurement for it.
+- Angles: 180° is a straight joint, smaller is more bent. Wrist height
+  says where the racket hand was relative to the head and shoulder.
+- If no fact applies to a shot, write one line, e.g. "At 17.9s, serve:
+  nothing to flag", rather than padding.
+- "Nothing to flag" means the available measurements look fine. If the
+  shuttle was not tracked after a shot, say that where it went could not be
+  checked, so the player knows the outcome was not judged.
+- End with two sentences on the one or two things that came up most often
+  in the clip.
 
-Write short, specific feedback for the player based ONLY on the retrieved
-coaching facts below. Reference roughly when (using timestamps) each piece of
-feedback applies.
+Shots:
+{shots_text}
 
-Important rules:
-- Only use the retrieved facts to ground your feedback. Do not invent advice
-  that isn't supported by them, and do not rely on outside badminton knowledge.
-- The search queries that retrieved these facts were generated by guessing
-  what shot or technique was being played, based on pose patterns alone. If
-  the retrieved facts for one pattern span multiple different techniques
-  (e.g. clear, smash, drive), do not commit to a single guess — instead,
-  briefly name each plausible shot type with its own corresponding advice.
-  For example: "Around t=4.7s, this could be a clear, smash, or drive. If a
-  clear: keep your elbow back to stretch your chest before accelerating
-  through. If a smash: avoid starting your jump with legs already straight."
-  Only name a single shot confidently if the retrieved facts are unusually
-  consistent and specific to one technique.
-- If the retrieved facts for a query don't actually seem relevant to the
-  observed pattern, skip that query rather than forcing a connection.
-- Before applying a common_mistake warning, check that the direction of the
-  observed angle change actually matches what the mistake describes. For
-  example, if a mistake warns about a movement starting already extended,
-  only apply it if the observations show the angle starting high — not
-  starting low and increasing, which is the opposite situation. Skip the
-  warning if the direction doesn't match.
-- Keep feedback to 2-4 sentences per notable pattern.
-- State the timestamp plainly (e.g. "Around t=4.7s:"). Do not label the
-  moment with a phase name like "(acceleration phase)" or "(preparation
-  phase)" — you don't actually know what phase of the shot this is, only
-  that the angle changed, so naming a phase would overstate what the data
-  supports.
-- A complete badminton action (preparation through follow-through) typically
-  takes at least about 1 second. Instead of citing only the two samples
-  where the angle change looked sharpest, look at the surrounding
-  observations immediately before and after that change and include them in
-  the cited range, so the timestamp window reflects the shot's realistic
-  duration (at least ~1 second) rather than just the moment of fastest
-  change.
-
-Pose observations:
-{observations_text}
-
-Retrieved coaching knowledge:
+Retrieved coaching facts:
 {knowledge_text}
-
-Write your feedback now.
 """
 
 
 # ============================================================
-# STEP 1: FORMAT RETRIEVED KNOWLEDGE FOR THE PROMPT
+# STEP 1: WRITE THE FEEDBACK (ONE CLAUDE CALL)
 # ============================================================
 
-def format_knowledge_for_prompt(retrieved_knowledge: dict) -> str:
+def synthesize_feedback(events: list, results: dict, discipline: str) -> str:
     """
-    Converts the retrieved knowledge dict from knowledge_agent.py into a
-    readable text block for SYNTHESIS_PROMPT.
-
-    Args:
-        retrieved_knowledge: Dict mapping query strings to lists of fact
-                              dicts, e.g. {"elbow extension during overhead
-                              clear": [fact1, fact2, ...]}
-
-    Returns:
-        Multi-line string grouping each query with its retrieved facts
+    Sends one window's shots and retrieved facts to Claude and returns the
+    feedback text. Empty string if the API call fails.
     """
 
-    lines = []
-
-    for query, facts in retrieved_knowledge.items():
-        lines.append(f"For query \"{query}\":")
-
-        for fact in facts:
-            technique = fact.get("technique", "")
-            cue = fact.get("cue", "")
-            mistake = fact.get("common_mistake", "")
-
-            line = f"  - ({technique}) {cue}"
-            if mistake:
-                line += f" Mistake to avoid: {mistake}"
-
-            lines.append(line)
-
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-# ============================================================
-# STEP 2: SYNTHESIZE FEEDBACK (LLM CALL 2)
-# ============================================================
-
-def synthesize_feedback(observations: list, retrieved_knowledge: dict) -> str:
-    """
-    Sends one window's pose observations and retrieved coaching facts to the
-    LLM and asks it to write grounded, timestamped feedback for the player.
-
-    Args:
-        observations: List of observation dicts for ONE time window
-        retrieved_knowledge: Dict mapping queries to retrieved fact lists,
-                              from knowledge_agent.retrieve_knowledge_for_segment()
-
-    Returns:
-        Feedback text written by the LLM. Empty string if the API call fails.
-    """
-
-    # Build the two text blocks that go into the prompt
-    observations_text = format_observations_for_prompt(observations)
-    knowledge_text = format_knowledge_for_prompt(retrieved_knowledge)
-
-    # Fill in the prompt template
-    # (using .replace() instead of .format() for the same reason as the
-    # other prompts in this project — avoids literal braces being
-    # misinterpreted as placeholders)
-    prompt = SYNTHESIS_PROMPT.replace("{observations_text}", observations_text)
-    prompt = prompt.replace("{knowledge_text}", knowledge_text)
+    # Fill in the prompt template (.replace() rather than .format(), so
+    # braces in the facts can't be mistaken for placeholders)
+    prompt = (SYNTHESIS_PROMPT
+              .replace("{discipline}", discipline)
+              .replace("{shots_text}", format_shots_for_prompt(events))
+              .replace("{knowledge_text}", format_facts_for_prompt(results)))
 
     try:
-        # Call the Claude API
         response = client.messages.create(
             model=MODEL,
-            max_tokens=800,
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
+            max_tokens=MAX_FEEDBACK_TOKENS,
+            messages=[{"role": "user", "content": prompt}],
         )
-
-        # This step produces natural-language feedback, not JSON — so we
-        # just return the raw text directly, no parsing needed
-        return response.content[0].text.strip()
+        # The reply is plain text; take the text block (the model also
+        # returns a thinking block, which is not the feedback)
+        text = " ".join(block.text for block in response.content if block.type == "text").strip()
+        if not text:
+            print(f"  ERROR during synthesis: the reply had no text (stop reason: {response.stop_reason}). "
+                  f"If the stop reason is max_tokens, raise MAX_FEEDBACK_TOKENS.")
+        return text
 
     except Exception as e:
-        print(f"  ERROR during synthesis: {e}")
+        print(f"  ERROR during synthesis: {type(e).__name__}: {e}")
         return ""
 
 
 # ============================================================
-# STEP 3: RUN THE FULL PIPELINE
+# STEP 2: RUN THE FULL FEEDBACK STEP
 # ============================================================
+
+def print_ready(feedback: str, width: int = 88) -> str:
+    """Wraps each paragraph of the feedback to the given width for the terminal."""
+    if not feedback:
+        return "(no feedback was produced — see the ERROR line above)"
+    return "\n\n".join(textwrap.fill(paragraph.strip(), width) for paragraph in feedback.split("\n") if paragraph.strip())
+
 
 def _save_json(path: str, data) -> None:
     """Writes data as readable JSON, creating the folder if needed."""
@@ -215,55 +152,45 @@ def _save_json(path: str, data) -> None:
         json.dump(data, f, indent=2)
 
 
-def run_pipeline(unified_data_path: str, racket_arm: str = "right",
-                 video_path: str = None, output_dir: str = "outputs") -> dict:
+def run_pipeline(unified_data_path: str, events_path: str, racket_arm: str = "right",
+                 discipline: str = "singles", video_path: str = None, output_dir: str = "outputs") -> dict:
     """
-    Runs the full pipeline end to end, one time window at a time:
-      1. vision_agent.analyze_video() — CV data -> pose observations
-      2. knowledge_agent.group_observations_by_window() — split into windows of up to 30s
-      3. knowledge_agent.retrieve_knowledge_for_segment() — LLM call 1 + retrieval
-      4. synthesize_feedback() — LLM call 2 -> final feedback text
+    Writes the feedback for a clip whose shots have already been found and named:
+      1. vision_agent.analyze_video() — racket-arm check image + observations.json
+      2. knowledge_agent — queries from the shots, facts from the knowledge base
+      3. synthesize_feedback() — one Claude call per window
 
     Everything Claude was given is also saved, so the feedback can be checked:
-      <output_dir>/observations.json       the pose observations
-      <output_dir>/queries_and_facts.json  the search queries and the facts they found
-      <output_dir>/feedback.json           the final feedback per window
-
-    Args:
-        unified_data_path: Path to unified_data.json from the CV pipeline
-        racket_arm: "right" or "left" — the player's racket arm
-        video_path: The clip the data came from (for the racket-arm check image)
-        output_dir: Folder for the saved results
+      <output_dir>/observations.json       pose observations (reference)
+      <output_dir>/queries_and_facts.json  the queries and the facts they found, per window
+      <output_dir>/feedback.json           the feedback per window
 
     Returns:
         Dict mapping window label (e.g. "whole clip" or "0-30s") -> feedback text
     """
 
-    # Step 1: get pose observations from the Vision Agent
     observations = analyze_video(unified_data_path, racket_arm=racket_arm,
                                  video_path=video_path, output_dir=output_dir)
+    _save_json(os.path.join(output_dir, "observations.json"), observations)
 
-    # Step 2: split observations into time windows
-    windows = group_observations_by_window(observations)
+    with open(events_path) as f:
+        events = json.load(f)
 
-    # Step 3 + 4: for each window, retrieve knowledge and synthesize feedback
     feedback_by_window = {}
     queries_and_facts = {}
 
-    for label, window_observations in windows:
-        print(f"\nProcessing {label} ({len(window_observations)} sampled frames)...")
+    windows = group_events_by_window(events)
+    if not windows:
+        feedback_by_window["whole clip"] = "No shots were found in this clip, so there is nothing to give feedback on."
 
-        retrieved_knowledge = retrieve_knowledge_for_segment(window_observations)
-        queries_and_facts[label] = retrieved_knowledge
-
-        feedback = synthesize_feedback(window_observations, retrieved_knowledge)
-        feedback_by_window[label] = feedback
-
-        # Small delay before moving to the next window
+    for label, window_events in windows:
+        print(f"\nProcessing {label} ({len(window_events)} shots, {discipline})...")
+        queries = build_queries(window_events)
+        results = retrieve_facts(queries, discipline)
+        queries_and_facts[label] = results
+        feedback_by_window[label] = synthesize_feedback(window_events, results, discipline)
         time.sleep(API_DELAY_SECONDS)
 
-    # Save what Claude saw and what it wrote
-    _save_json(os.path.join(output_dir, "observations.json"), observations)
     _save_json(os.path.join(output_dir, "queries_and_facts.json"), queries_and_facts)
     _save_json(os.path.join(output_dir, "feedback.json"), feedback_by_window)
     print(f"\nSaved observations, queries/facts and feedback → {output_dir}/")
@@ -276,22 +203,24 @@ def run_pipeline(unified_data_path: str, racket_arm: str = "right",
 # ============================================================
 
 if __name__ == "__main__":
+    import argparse
 
-    # Path to your unified data — same as vision_agent.py and knowledge_agent.py
-    UNIFIED_DATA_PATH = "outputs/unified_data.json"
+    parser = argparse.ArgumentParser(description="Write coaching feedback from a clip's saved shots.")
+    parser.add_argument("--video", default="data/test_clip.MOV", help="the clip (for the racket-arm check image)")
+    parser.add_argument("--racket-arm", choices=["right", "left"], default="right")
+    parser.add_argument("--discipline", choices=["singles", "doubles"], default="singles")
+    parser.add_argument("--output-dir", default="outputs", help="folder holding unified_data.json and shot_events.json")
+    args = parser.parse_args()
 
-    # The clip the data came from — used for the racket-arm check image
-    VIDEO_PATH = "data/test_clip.MOV"
+    feedback_by_window = run_pipeline(
+        os.path.join(args.output_dir, "unified_data.json"),
+        os.path.join(args.output_dir, "shot_events.json"),
+        racket_arm=args.racket_arm, discipline=args.discipline,
+        video_path=args.video, output_dir=args.output_dir,
+    )
 
-    # Change to "left" if the player is left-handed
-    RACKET_ARM = "right"
-
-    # Run the full pipeline
-    feedback_by_window = run_pipeline(UNIFIED_DATA_PATH, racket_arm=RACKET_ARM, video_path=VIDEO_PATH)
-
-    # Print the final feedback for each window
     for label, feedback in feedback_by_window.items():
         print(f"\n{'=' * 60}")
         print(f"FEEDBACK — {label}")
         print('=' * 60)
-        print(feedback)
+        print(print_ready(feedback))

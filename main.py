@@ -5,7 +5,7 @@ from src.vision.pipeline import run_pipeline as run_cv_pipeline
 from src.vision.shot_events import detect_shots
 from src.agents.shot_classifier import classify_shots
 from src.agents.vision_agent import analyze_video
-from src.agents.orchestrator import run_pipeline as run_coaching_pipeline, _save_json
+from src.agents.orchestrator import run_pipeline as run_coaching_pipeline, _save_json, print_ready
 
 
 def main():
@@ -17,6 +17,9 @@ def main():
                          help="Which arm holds the racket (default: right). Check "
                               "outputs/racket_arm_check.jpg afterwards to confirm the right arm "
                               "is being measured — MediaPipe can mirror sides on footage shot from behind")
+    parser.add_argument("--discipline", choices=["singles", "doubles"], default="singles",
+                         help="singles or doubles (default: singles) — keeps advice for the other "
+                              "discipline out of the feedback")
     parser.add_argument("--output-dir", default="outputs",
                          help="Folder for intermediate and output files (default: outputs)")
     parser.add_argument("--no-feedback", action="store_true",
@@ -44,14 +47,15 @@ def main():
         return
 
     print("\nStep 3/3 — Generating coaching feedback...")
-    feedback_by_window = run_coaching_pipeline(unified_data_path, racket_arm=args.racket_arm,
-                                               video_path=args.video, output_dir=args.output_dir)
+    feedback_by_window = run_coaching_pipeline(unified_data_path, events_path, racket_arm=args.racket_arm,
+                                               discipline=args.discipline, video_path=args.video,
+                                               output_dir=args.output_dir)
 
     for label, feedback in feedback_by_window.items():
         print(f"\n{'=' * 60}")
         print(f"FEEDBACK — {label}")
         print('=' * 60)
-        print(feedback)
+        print(print_ready(feedback))
 
 
 if __name__ == "__main__":
