@@ -91,7 +91,7 @@
   .feedback-card .t { color: var(--accent); font-weight: 600; }
   .steps { display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 1.25rem; }
   .step {
-    flex: 1 1 220px;
+    flex: 1 1 180px;
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: 12px;
@@ -144,12 +144,12 @@
     <h2>Demo</h2>
     <p class="section-lede">One command takes a raw clip to timestamped coaching feedback: select the player to analyze with a click, and the pipeline does the rest.</p>
     <video src="assets/demo.mp4" controls muted playsinline preload="metadata"></video>
-    <p class="caption">Real, uncut input and output — only about a minute of processing in the middle is trimmed for brevity.</p>
+    <p class="caption">Real input and output from one run. Two stretches of waiting for processing, about a minute and a half in total, are cut for brevity.</p>
   </section>
 
   <section>
-    <h2>What it sees, what it says</h2>
-    <p class="section-lede">A skeleton is tracked on the selected player frame by frame; the feedback cites specific timestamps and joint angles from that data.</p>
+    <h2>What it sees &amp; what it says</h2>
+    <p class="section-lede">A skeleton is tracked on the selected player frame by frame. Each shot is found and named from that data, and the feedback cites the shot's time and measurements.</p>
     <div class="duo">
       <div class="clip">
         <video src="assets/pose_overlay_clip.mp4" controls muted loop playsinline preload="metadata"></video>
@@ -157,11 +157,12 @@
       </div>
       <div class="feedback">
         <div class="feedback-card">
-          <p><span class="t">Around t=3.3s</span> (overhead position with shuttle contact): your elbow extends to 151° and wrist moves overhead. If this is a clear or smash, focus on accelerating your elbow forwards after this preparation — the facts emphasize that delayed elbow movement and chest stretch are key to power. If a smash specifically, avoid rotating only your forearm; rotate your whole arm and complete the sequence with your wrist for full power generation.</p>
-          <p><span class="t">Around t=7.6s–7.9s,</span> with wrist below shoulder and very extended elbow (171–174°): this appears to be a lift or low defensive shot. Ensure you're lifting with height to give your partner time to recover; lifting flat onto the strings makes it easier for your opponent to attack. Your knee angle here (135–145°) shows some bend, which is good for control, but commit to driving through with height.</p>
-          <p><span class="t">Around t=9.4s–9.9s</span> (overhead position with shuttle contact): this could be a clear, smash, or drop shot. If a smash: your elbow angle changes sharply from 47° to 174° — keep your elbow back longer during the early preparation to stretch your chest before explosive acceleration, rather than extending it so quickly. Also ensure you rotate your whole forearm and wrist together at the end for maximum power, not just the lower forearm.</p>
+          <p><span class="t">At 3.4s, most likely a drop, possibly a smash or clear:</span> your racket arm was overhead and well above the shoulder at the fastest moment, which fits any of the three. For the drop interpretation, you don't need to take it at the very highest point — let the shuttle drop slightly into a comfortable hitting zone. Your elbow at contact (151°) was bent enough that the smash's "arm too straight" mistake doesn't apply here.</p>
+          <p><span class="t">At 5.6s, lift:</span> the shuttle climbed 8.7 shoulder widths above head height, which fits getting well underneath it with your strings to generate height. Nothing to flag.</p>
+          <p><span class="t">At 7.6s, most likely a block/defence, possibly a lift or net shot:</span> your knee bend was deep (100°) going into the shot, which is the kind of lowered, ready posture defensive play calls for, so no issue there. Your elbow was nearly straight (164°) at contact — if this was in fact a net shot, a fully straight arm reduces strength and balance, so work on keeping it slightly bent through contact.</p>
+          <p><span class="t">At 9.9s, most likely a drop, possibly a smash or clear:</span> preparation looked similar to your first drop, with the racket hand overhead at the fastest moment. As with the earlier drop, you don't have to contact the shuttle at its peak — letting it fall a touch into a comfortable zone is fine, and your elbow (150°) wasn't locked straight, so there's no smash-style straight-arm issue to flag.</p>
         </div>
-        <p class="caption">Feedback excerpt from the same clip — generated, not hand-written</p>
+        <p class="caption">Feedback excerpt from the run shown in the demo above — generated, not hand-written</p>
       </div>
     </div>
   </section>
@@ -176,11 +177,16 @@
       </div>
       <div class="step">
         <span class="num">2</span>
-        <h3>Retrieve</h3>
-        <p>Claude reads the clip's joint-angle and wrist-height patterns and turns them into search queries against a knowledge base of ~2,900 coaching facts extracted from 165 tutorial videos (ChromaDB).</p>
+        <h3>Name the shots</h3>
+        <p>Each shot is found from the racket wrist's speed, then named (smash, clear, drop, lift, net shot, block, serve) from where the racket hand was at contact and how the shuttle flew.</p>
       </div>
       <div class="step">
         <span class="num">3</span>
+        <h3>Retrieve</h3>
+        <p>Each shot's name and measurements become search queries against a knowledge base of 2,090 coaching facts extracted from 117 tutorial videos (ChromaDB).</p>
+      </div>
+      <div class="step">
+        <span class="num">4</span>
         <h3>Coach</h3>
         <p>Claude writes timestamped feedback grounded strictly in the retrieved facts — naming several plausible shot types when the data is ambiguous instead of guessing confidently.</p>
       </div>
@@ -190,8 +196,8 @@
   <section>
     <h2>Honest limitations</h2>
     <ul class="limits">
-      <li>Shot-type identification from pose alone is inherently ambiguous — feedback names multiple plausible shots rather than guessing.</li>
       <li>Shuttle detection is sensitive to lighting, background clutter, and camera angle on amateur footage.</li>
+      <li>Very soft net shots by professionals barely move the wrist and can be missed. Forehand vs. backhand isn't identified yet.</li>
       <li>Tested on ~15–34 second clips so far; feedback quality is a starting point for reflection, not a substitute for a coach's judgment.</li>
     </ul>
   </section>
