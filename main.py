@@ -1,4 +1,6 @@
 import argparse
+import datetime
+import json
 import os
 
 from src.vision.pipeline import run_pipeline as run_cv_pipeline
@@ -25,6 +27,13 @@ def main():
     parser.add_argument("--no-feedback", action="store_true",
                          help="Stop after finding and naming shots (no Claude calls) — useful when "
                               "scoring detection against hand labels")
+    parser.add_argument("--save-history", action="store_true",
+                         help="Also save the clip, its shots and the feedback to the history database "
+                              "named by DATABASE_URL in .env (off unless given)")
+    parser.add_argument("--player", default="player",
+                         help="With --save-history: whose clip this is (default: player)")
+    parser.add_argument("--date", type=datetime.date.fromisoformat,
+                         help="With --save-history: the day the clip was played, YYYY-MM-DD (default: today)")
     args = parser.parse_args()
 
     print("Step 1/3 — Running CV pipeline (player selection, pose, shuttle detection)...")
@@ -44,6 +53,8 @@ def main():
                                      video_path=args.video, output_dir=args.output_dir)
         _save_json(os.path.join(args.output_dir, "observations.json"), observations)
         print(f"\nStopping before feedback (--no-feedback). Shots saved → {events_path}")
+        if args.save_history:
+            save_history(args, events_path, feedback_by_window=None)
         return
 
     print("\nStep 3/3 — Generating coaching feedback...")
@@ -56,6 +67,23 @@ def main():
         print(f"FEEDBACK — {label}")
         print('=' * 60)
         print(print_ready(feedback))
+
+    if args.save_history:
+        save_history(args, events_path, feedback_by_window)
+
+
+def save_history(args, events_path: str, feedback_by_window: dict | None) -> None:
+    """Saves this run to the history database. Imported here so normal runs never need it."""
+    print("\nSaving to the history database...")
+    try:
+        from src.storage.history import save_run_safely
+    except ImportError as e:
+        print(f"WARNING: history not saved — {e}. Install it with: pip install \"psycopg[binary]\"")
+        return
+    with open(events_path) as f:
+        events = json.load(f)
+    save_run_safely(events, feedback_by_window, args.video, player=args.player, played_on=args.date,
+                    discipline=args.discipline, racket_arm=args.racket_arm)
 
 
 if __name__ == "__main__":

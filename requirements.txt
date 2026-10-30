@@ -5,3 +5,4 @@ anthropic
 chromadb
 python-dotenv
 numpy
+psycopg[binary]

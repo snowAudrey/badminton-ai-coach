@@ -28,7 +28,7 @@ The project has two pipelines: a computer vision pipeline that turns video into 
 
 ## Tech stack
 
-Python · OpenCV · YOLOv8 · MediaPipe · NumPy · Google Colab · Claude API · ChromaDB
+Python · OpenCV · YOLOv8 · MediaPipe · NumPy · Google Colab · Claude API · ChromaDB · PostgreSQL on Amazon RDS (optional history)
 
 ## Setup
 
@@ -66,6 +66,27 @@ Flags:
 - `--racket-arm` — `right` or `left` (default: `right`). Afterwards, open `outputs/racket_arm_check.jpg` and confirm the yellow arm is your racket arm — MediaPipe can mirror left and right on footage shot from behind
 - `--discipline` — `singles` or `doubles` (default: `singles`); keeps advice meant for the other discipline out of the feedback
 - `--output-dir` — where intermediate files are saved (default: `outputs`)
+- `--save-history` — also save the clip, its shots and the feedback to the optional history database (see below); off unless given
+- `--player`, `--date` — with `--save-history`: whose clip it is (default: `player`) and the day it was played (default: today)
+
+## Optional: progress history (PostgreSQL on Amazon RDS)
+
+One clip's feedback is a snapshot; progress shows up across sessions. With `--save-history`, each run is also saved to a PostgreSQL database in three linked tables: `clips` (one row per analyzed video), `shots` (one row per shot, with its name, confidence and main measurements, plus every measurement as JSON) and `feedback`. The tables are defined in `src/storage/schema.sql` and created automatically on the first save. Saving the same video again for the same player and day replaces the earlier save. A failed save only prints a warning; the local results are never affected, and without the flag nothing connects to the database at all.
+
+Setup, once: create a PostgreSQL database (here on Amazon RDS, allowing connections only from your own IP), then add its address to `.env`:
+```
+DATABASE_URL=postgresql://USERNAME:PASSWORD@ENDPOINT:5432/badminton?sslmode=require
+```
+
+Use:
+```
+python main.py --video data/test_clip.MOV --save-history             # analyze and save
+python -m src.storage.history                                         # sessions saved so far
+python -m src.storage.history --shot clear                            # every clear, oldest first
+python -m src.storage.history --save outputs/pro --video data/test_clip_pro.MOV   # save an earlier run's folder
+```
+
+`src/storage/example_queries.sql` has SQL for questions like "has my elbow at contact on clears changed across sessions?" and "which shots was the tool unsure how to name?".
 
 ## Example output
 
