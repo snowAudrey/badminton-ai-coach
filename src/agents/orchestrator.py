@@ -42,10 +42,12 @@ client = anthropic.Anthropic()
 
 # Model that writes the feedback. One call per clip, so the stronger model
 # is affordable. Sonnet 5 thinks before it answers, and that thinking counts
-# against the reply limit — 1,500 tokens was used up entirely by thinking
-# and no feedback text came back, so the limit is generous
+# against the reply limit: at the default effort it has used up 1,500 and
+# then 8,000 tokens on thinking alone, leaving no feedback text. "medium"
+# effort keeps the thinking shorter, and the limit leaves room for both
 MODEL = "claude-sonnet-5"
-MAX_FEEDBACK_TOKENS = 8000
+FEEDBACK_EFFORT = "medium"
+MAX_FEEDBACK_TOKENS = 16000
 
 # Small delay between API calls in seconds — avoids hitting rate limits
 API_DELAY_SECONDS = 0.5
@@ -119,14 +121,16 @@ def synthesize_feedback(events: list, results: dict, discipline: str) -> str:
         response = client.messages.create(
             model=MODEL,
             max_tokens=MAX_FEEDBACK_TOKENS,
+            output_config={"effort": FEEDBACK_EFFORT},
             messages=[{"role": "user", "content": prompt}],
         )
         # The reply is plain text; take the text block (the model also
         # returns a thinking block, which is not the feedback)
         text = " ".join(block.text for block in response.content if block.type == "text").strip()
         if not text:
-            print(f"  ERROR during synthesis: the reply had no text (stop reason: {response.stop_reason}). "
-                  f"If the stop reason is max_tokens, raise MAX_FEEDBACK_TOKENS.")
+            print(f"  ERROR during synthesis: the reply had no text (stop reason: {response.stop_reason}, "
+                  f"{response.usage.output_tokens} tokens used). If the stop reason is max_tokens, "
+                  f"lower FEEDBACK_EFFORT or raise MAX_FEEDBACK_TOKENS.")
         return text
 
     except Exception as e:
