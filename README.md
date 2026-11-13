@@ -8,7 +8,7 @@ For amateur sports enthusiasts, access to a personal coach is often out of reach
 
 ## How it works
 
-The project has two pipelines: a computer vision pipeline that turns video into structured per-frame data, and a small pipeline of Claude-powered agents that turns that data into coaching feedback.
+The project has two pipelines: a computer vision pipeline that turns video into structured per-frame data, and a coaching pipeline that names each shot, retrieves matching coaching facts, and has Claude write the feedback.
 
 **1. Computer vision pipeline** (`src/vision/`)
 - `pose_estimator.py` — YOLOv8 detects players in the first frame; you click to select which player to track. Every frame after that, the tracker picks the detected person who could have got there since the last frame (no more than half a body height per frame, growing while the player is out of sight) and whose shirt colour matches the player you clicked, so it stays on your player past opponents, doubles partners and line judges. MediaPipe Pose then extracts 33 body keypoints from a crop around that person.
@@ -16,7 +16,7 @@ The project has two pipelines: a computer vision pipeline that turns video into 
 - `pipeline.py` — merges pose and shuttle data into one frame-indexed JSON (`unified_data.json`).
 - `shot_events.py` — finds each shot from the racket wrist's speed (measured relative to the shoulders, so running doesn't count), and records facts about it: wrist height before and at the swing, elbow and knee angles, how high the shuttle climbed afterwards, how fast it was coming in, and the pause since the previous shot (`shot_events.json`). When the shuttle is seen next to the racket, the frame where it comes closest is taken as the moment of contact — on soft shots the wrist is fastest just before or after the hit, not at it.
 
-**2. Coaching agent pipeline** (`src/agents/`)
+**2. Coaching pipeline** (`src/agents/`)
 - `shot_classifier.py` — names each shot (smash, clear, drop, drive, net shot, lift, block/defence, serve, return of serve) with rules on those facts: contact height decides overhead vs. underarm, an overhead hit the shuttle leaves fast is a smash, the shuttle's climb separates clear/lift from drop/net shot, a fast incoming shuttle returned with a short action is a block, a long pause with nothing incoming is a serve. Claude can be asked instead (`--use-claude`, with video frames), but on phone footage the shuttle is too small to see in the frames and it guessed, so the rules are the default.
 - `vision_agent.py` — keeps MediaPipe's left/right labels consistent across frames (they can flip on footage shot from behind) and saves a check image of the arm being measured, then converts raw keypoints into human-readable pose facts per sampled frame (elbow/knee angle measured from MediaPipe's 3D landmarks, wrist height relative to head and shoulder, shuttle presence) — descriptive only, no judgment about whether an angle is "good."
 - `knowledge_agent.py` — turns the named shots into knowledge-base searches: for each shot type in the clip, one query about its preparation, contact point and follow-through, plus one query for each measurement that stands out (elbow straight at contact, deep knee bend before the shot, contact below head height, a short swing on a clear, a big swing on a net shot). Searches are limited to that shot type and to the player's discipline, and no fact is returned twice.
